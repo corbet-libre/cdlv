@@ -1,0 +1,156 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          rustc -Vv > resolver.txt
+          cargo update
+          cargo metadata --locked --format-version 1 > dependency-metadata.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: resolved-lock
+          path: |
+            Cargo.lock
+            dependency-metadata.json
+            resolver.txt
+
+  check:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: resolved-lock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check formatting and retain suggested changes
+        id: formatting
+        continue-on-error: true
+        run: |
+          cargo fmt --all
+          git diff --exit-code -- src tests > formatting.patch
+      - uses: actions/upload-artifact@v4
+        if: steps.formatting.outcome == 'failure'
+        with:
+          name: formatting
+          path: formatting.patch
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Install matching Wasm test runner
+        run: |
+          version=$(jq -r '.packages[] | select(.name == "wasm-bindgen") | .version' dependency-metadata.json)
+          archive="wasm-bindgen-${version}-x86_64-unknown-linux-musl.tar.gz"
+          base="https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}"
+          mkdir -p "$RUNNER_TEMP/wasm-runner"
+          cd "$RUNNER_TEMP/wasm-runner"
+          curl --fail --location --retry 3 --remote-name "$base/$archive"
+          curl --fail --location --retry 3 --remote-name "$base/$archive.sha256sum"
+          checksum=$(cut -d ' ' -f1 "$archive.sha256sum")
+          printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check
+          tar -xzf "$archive" --strip-components=1
+          echo "$PWD" >> "$GITHUB_PATH"
+      - name: Execute browser vectors
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          WASM_BINDGEN_USE_BROWSER: '1'
+          WASM_BINDGEN_TEST_TIMEOUT: '60'
+        run: |
+          export CHROMEDRIVER="$(command -v chromedriver)"
+          cargo test --locked --target wasm32-unknown-unknown --test delivery
+
+      - name: Require formatting
+        if: always() && steps.formatting.outcome != 'success'
+        run: exit 1
+
+  dependency-policy:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: resolved-lock
+      - run: python3 .github/check-first-party.py
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny --locked check advisories
+
+  coverage:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: resolved-lock
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+          cache-on-failure: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --locked --branch --no-cfg-coverage --no-cfg-coverage-nightly --json --output-path coverage.json --ignore-filename-regex '/tests/'
+      - run: cargo llvm-cov report --locked --branch --ignore-filename-regex '/tests/' --lcov --output-path coverage.lcov
+      - run: cargo llvm-cov report --locked --branch --ignore-filename-regex '/tests/' --text --show-line-counts-or-regions --show-instantiations=false --output-path coverage.txt
+      - run: |
+          python3 .github/test-source-coverage.py
+          python3 .github/check-source-coverage.py coverage.lcov coverage.json coverage.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: |
+            coverage.json
+            coverage.lcov
+            coverage.txt
+            Cargo.lock
+            resolver.txt
