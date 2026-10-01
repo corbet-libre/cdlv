@@ -483,7 +483,7 @@ dependencies = [
 [[package]]
 name = "cthr"
 version = "0.1.0"
-source = "git+https://github.com/corbet-foss/cthr?branch=main#dd96842cd15c10eb8c902c8f0e90caccb031ada8"
+source = "git+https://github.com/corbet-foss/cthr?branch=main#6dcdc1adbf67c31bab90b80aa0a9bc49b396ad9f"
 dependencies = [
  "cgrp",
  "ckmg",

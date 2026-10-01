@@ -1,0 +1,32 @@
+[
+  {
+    "file": "src/lib.rs",
+    "line": 560,
+    "source": "|| !record.outgoing",
+    "branch": {
+      "block": 0,
+      "id": 0
+    },
+    "target": "native",
+    "reason": "The preceding Pending-status test excludes every inbound record: load rejects inbound non-Accepted states, received constructs inbound Accepted, and no mutator changes an inbound record to Pending. Only the true arm of this subsequent not-outgoing test is unreachable.",
+    "evidence": "docs/COVERAGE.md#inbound-record-state-invariant",
+    "evidence_sources": {
+      "src/lib.rs": "1950ea26de913feaaf4fe18c573374308d624061ce2c8fe156756f95ffc4264b"
+    }
+  },
+  {
+    "file": "src/lib.rs",
+    "line": 631,
+    "source": "if record.outgoing || record.status != Status::Accepted {",
+    "branch": {
+      "block": 1,
+      "id": 2
+    },
+    "target": "native",
+    "reason": "The preceding outgoing test leaves only inbound records. Their private construction/load invariant requires Accepted status, so the subsequent non-Accepted true arm is unreachable.",
+    "evidence": "docs/COVERAGE.md#inbound-record-state-invariant",
+    "evidence_sources": {
+      "src/lib.rs": "1950ea26de913feaaf4fe18c573374308d624061ce2c8fe156756f95ffc4264b"
+    }
+  }
+]

@@ -52,3 +52,11 @@ cannot reach its ciphertext getter. Threads refusals keep their original typed
 error instead of being reported as a storage failure. The complete wire envelope
 is byte-bounded before parsing; JSON byte-array encoding necessarily bounds its
 inner payload more tightly, so there is no redundant larger inner allocation cap.
+
+Restore validates each record's peer certificate purpose/scope, direction/status,
+and exact retained Data/ACK envelope. Conversation, sender, recipient, message ID,
+epoch and signature must match the record before retry or acceptance is exposed.
+Historical signatures remain verifiable after rotation; live publication and
+retry separately require current device authority. Real encrypted-Store vectors
+alter these fields and receipts, and race a separate Store writer against
+recipient publication. A failed compound write releases neither history nor ACK.

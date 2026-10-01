@@ -351,6 +351,11 @@ async fn restored_record_refusals(fixture: &Fixture, source: &Store<Memory>) {
         changed["wire"] = serde_json::json!([0]);
         damaged.push(changed);
     }
+    if record["outgoing"] == true && !record["ack"].is_null() {
+        let mut changed = record.clone();
+        changed["status"] = serde_json::json!("Pending");
+        damaged.push(changed);
+    }
     let (_, mut store) = fixture.store().await;
     for (index, changed) in damaged.into_iter().enumerate() {
         let mut journal = original.clone();
@@ -378,6 +383,374 @@ async fn restored_record_refusals(fixture: &Fixture, source: &Store<Memory>) {
             Delivery::load(fixture.binding.clone(), &store).is_err(),
             "accepted changed record {index}"
         );
+    }
+    let mut zero = original.clone();
+    let mut zero_record = record.clone();
+    zero_record["id"] = serde_json::to_value([0u8; 32]).unwrap();
+    zero["records"] = serde_json::json!({});
+    zero["records"]["00".repeat(32)] = zero_record;
+    let bytes = serde_json::to_vec(&zero).unwrap();
+    store
+        .commit(
+            store.version().unwrap(),
+            [99; 32],
+            &[cwst::Change::Put {
+                owner: "cdlv",
+                key: b"journal.v1",
+                value: &bytes,
+            }],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        Delivery::load(fixture.binding.clone(), &store).err(),
+        Some(cdlv::Error::Encoding)
+    );
+}
+
+// Malformed restored owner journals are parser inputs, never proof issuers.
+// The sender candidate still comes from the actual MLS provider and Keys port.
+async fn restored_capacity_and_duplicate_refusals(f: &mut Fixture, source: &Store<Memory>) {
+    let original: serde_json::Value =
+        serde_json::from_slice(source.read("cdlv", b"journal.v1").unwrap().unwrap()).unwrap();
+    let mut template = original["records"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    template["wire"] = serde_json::Value::Null;
+    let thread_bytes = source.read("cthr", &SLOT).unwrap().unwrap();
+    let contact_bytes = source.read("ctcs", b"journal.v1").unwrap().unwrap();
+    let mut full = original.clone();
+    full["records"] = serde_json::json!({});
+    for index in 0u32..1025 {
+        let id = *ckmg::hash(&index.to_be_bytes()).value();
+        let mut record = template.clone();
+        record["id"] = serde_json::to_value(id).unwrap();
+        let name: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
+        full["records"][name] = record;
+    }
+    let (_, mut store) = f.store().await;
+    let oversized = serde_json::to_vec(&full).unwrap();
+    assert!(oversized.len() <= cwst::MAX_VALUE_BYTES);
+    store
+        .commit(
+            0,
+            [1; 32],
+            &[cwst::Change::Put {
+                owner: "cdlv",
+                key: b"journal.v1",
+                value: &oversized,
+            }],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        Delivery::load(f.binding.clone(), &store).err(),
+        Some(cdlv::Error::Limit)
+    );
+    let first = full["records"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    full["records"].as_object_mut().unwrap().remove(&first);
+    let bytes = serde_json::to_vec(&full).unwrap();
+    let (_, mut store) = f.store().await;
+    store
+        .commit(
+            0,
+            [1; 32],
+            &[
+                cwst::Change::Put {
+                    owner: "cthr",
+                    key: &SLOT,
+                    value: thread_bytes,
+                },
+                cwst::Change::Put {
+                    owner: "ctcs",
+                    key: b"journal.v1",
+                    value: contact_bytes,
+                },
+                cwst::Change::Put {
+                    owner: "cdlv",
+                    key: b"journal.v1",
+                    value: &bytes,
+                },
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+    let threads = Threads::load(f.binding.clone(), SLOT, &store).unwrap();
+    let next = threads
+        .send(&mut f.port(), &mut Grant::new(), b"capacity")
+        .await
+        .unwrap();
+    assert_eq!(
+        Delivery::load(f.binding.clone(), &store)
+            .unwrap()
+            .outgoing(next, &contacts(f, &store))
+            .err(),
+        Some(cdlv::Error::Limit)
+    );
+    let next = threads
+        .send(&mut f.port(), &mut Grant::new(), b"duplicate restored id")
+        .await
+        .unwrap();
+    let id = *next.prepared_message().unwrap().id();
+    template["id"] = serde_json::to_value(id).unwrap();
+    let name: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut duplicate = original;
+    duplicate["records"] = serde_json::json!({});
+    duplicate["records"][name] = template;
+    let bytes = serde_json::to_vec(&duplicate).unwrap();
+    let (_, mut alternate) = f.store().await;
+    alternate
+        .commit(
+            0,
+            [1; 32],
+            &[
+                cwst::Change::Put {
+                    owner: "cthr",
+                    key: &SLOT,
+                    value: thread_bytes,
+                },
+                cwst::Change::Put {
+                    owner: "ctcs",
+                    key: b"journal.v1",
+                    value: contact_bytes,
+                },
+                cwst::Change::Put {
+                    owner: "cdlv",
+                    key: b"journal.v1",
+                    value: &bytes,
+                },
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        Delivery::load(f.binding.clone(), &alternate)
+            .unwrap()
+            .outgoing(next, &contacts(f, &alternate))
+            .err(),
+        Some(cdlv::Error::Conflict)
+    );
+}
+
+async fn copied_store(f: &Fixture, source: &Store<Memory>) -> Store<Memory> {
+    let (_, mut store) = f.store().await;
+    let mut changes = Vec::new();
+    for (owner, key) in [
+        ("cthr", SLOT.as_slice()),
+        ("ctcs", b"journal.v1".as_slice()),
+        ("cdlv", b"journal.v1".as_slice()),
+    ] {
+        if let Some(value) = source.read(owner, key).unwrap() {
+            changes.push(cwst::Change::Put { owner, key, value });
+        }
+    }
+    store.commit(0, [1; 32], &changes, &[]).await.unwrap();
+    store
+}
+
+async fn reopen(f: &mut Fixture, peer: &str, store: &mut Store<Memory>) {
+    f.control(peer, ctcs::Action::Close, store, 10).await;
+    f.control(
+        peer,
+        ctcs::Action::Reopen {
+            conversation: [18; 32],
+        },
+        store,
+        11,
+    )
+    .await;
+    let evidence = SigningKey::from_bytes(&[72; 32])
+        .sign(&answer_bytes(&f.binding, peer, &[18; 32]))
+        .to_bytes()
+        .to_vec();
+    f.control(
+        peer,
+        ctcs::Action::Answered {
+            conversation: [18; 32],
+            evidence,
+        },
+        store,
+        12,
+    )
+    .await;
+}
+
+// A currently authorized peer can sign a wrapper around another conversation's
+// real ciphertext. Neither that signature nor an established contact authorizes
+// changing the actual MLS sender, epoch, conversation or owner checkpoint.
+async fn crossed_envelope_refusals(
+    owners: (&mut Fixture, &mut Fixture),
+    stores: (&Store<Memory>, &Store<Memory>),
+    handles: (&KeyHandle, &KeyHandle),
+    wire: &[u8],
+) -> Fixture {
+    let (a, b) = owners;
+    let (astore, bstore) = stores;
+    let (ah, bh) = handles;
+    let mut outsider = Fixture::new("charlie", 3, a.directory.clone()).await;
+    let ch = outsider.keys.key(cdlv::purpose()).await.unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(wire).unwrap();
+    let payload: Vec<u8> =
+        serde_json::from_value(envelope["body"]["Data"]["wire"].clone()).unwrap();
+    let id = *ckmg::hash(&payload).value();
+    for case in 0..3 {
+        let mut store = copied_store(b, bstore).await;
+        let conversation = if case == 2 { [18; 32] } else { SLOT };
+        if case == 1 {
+            b.establish("charlie", &mut store).await;
+        }
+        if case == 2 {
+            reopen(b, "alice", &mut store).await;
+        }
+        let claim = WireClaim::Data {
+            id,
+            epoch: if case == 0 { 2 } else { 1 },
+            wire: payload.clone(),
+        };
+        let malformed = if case == 1 {
+            outsider.wire_claim(&ch, "bob", conversation, claim).await
+        } else {
+            a.wire_claim(ah, "bob", conversation, claim).await
+        };
+        let delivery = Delivery::load(b.binding.clone(), &store).unwrap();
+        let current_contacts = contacts(b, &store);
+        let Authenticated::Data(incoming) = delivery
+            .authenticate(&malformed, &mut b.directory, &current_contacts)
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let prepared = Threads::load(b.binding.clone(), SLOT, &store)
+            .unwrap()
+            .receive(&mut b.port(), &mut Grant::new(), incoming.ciphertext())
+            .await
+            .unwrap();
+        assert_eq!(
+            delivery
+                .received(prepared, incoming, &mut b.keys, bh)
+                .await
+                .err(),
+            Some(cdlv::Error::Scope)
+        );
+    }
+    let mut store = copied_store(b, bstore).await;
+    let old_delivery = Delivery::load(b.binding.clone(), &store).unwrap();
+    let old_contacts = contacts(b, &store);
+    store
+        .commit(store.version().unwrap(), [2; 32], &[], &[])
+        .await
+        .unwrap();
+    let threads = Threads::load(b.binding.clone(), SLOT, &store).unwrap();
+    let prepared = threads
+        .send(&mut b.port(), &mut Grant::new(), b"new checkpoint")
+        .await
+        .unwrap();
+    assert_eq!(
+        old_delivery.outgoing(prepared, &old_contacts).err(),
+        Some(cdlv::Error::Scope)
+    );
+    let (_, mut cstore) = outsider.store().await;
+    outsider.establish("alice", &mut cstore).await;
+    let prepared = threads
+        .send(&mut b.port(), &mut Grant::new(), b"foreign owner")
+        .await
+        .unwrap();
+    assert_eq!(
+        Delivery::load(outsider.binding.clone(), &cstore)
+            .unwrap()
+            .outgoing(prepared, &contacts(&outsider, &cstore))
+            .err(),
+        Some(cdlv::Error::Scope)
+    );
+    let wrong_peer_ack = outsider
+        .wire_claim(&ch, "alice", SLOT, WireClaim::Ack { id, epoch: 1 })
+        .await;
+    let current_contacts = contacts(a, astore);
+    assert_eq!(
+        Delivery::load(a.binding.clone(), astore)
+            .unwrap()
+            .authenticate(&wrong_peer_ack, &mut a.directory, &current_contacts)
+            .await
+            .err(),
+        Some(cdlv::Error::Authority)
+    );
+    outsider
+}
+
+async fn restored_pending_scope_refusals(
+    a: &mut Fixture,
+    outsider: &Fixture,
+    source: &Store<Memory>,
+    outgoing: &cthr::Outgoing<'_>,
+    handle: &KeyHandle,
+) {
+    let original: serde_json::Value =
+        serde_json::from_slice(source.read("cdlv", b"journal.v1").unwrap().unwrap()).unwrap();
+    for case in 0..3 {
+        let mut changed = original.clone();
+        let record = changed["records"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap();
+        record["wire"] = serde_json::Value::Null;
+        match case {
+            0 => record["conversation"] = serde_json::to_value([18u8; 32]).unwrap(),
+            1 => record["epoch"] = serde_json::json!(2),
+            _ => {
+                record["peer"] = serde_json::json!("charlie");
+                record["peer_certificate"] =
+                    serde_json::to_value(outsider.handle.certificate()).unwrap();
+            }
+        }
+        let mut store = copied_store(a, source).await;
+        let bytes = serde_json::to_vec(&changed).unwrap();
+        store
+            .commit(
+                store.version().unwrap(),
+                [2; 32],
+                &[cwst::Change::Put {
+                    owner: "cdlv",
+                    key: b"journal.v1",
+                    value: &bytes,
+                }],
+                &[],
+            )
+            .await
+            .unwrap();
+        let delivery = Delivery::load(a.binding.clone(), &store).unwrap();
+        let before = store.version().unwrap();
+        assert_eq!(
+            delivery
+                .wrap(
+                    outgoing,
+                    &mut a.keys,
+                    handle,
+                    &mut a.directory,
+                    &mut store,
+                    [3; 32]
+                )
+                .await
+                .err(),
+            Some(cdlv::Error::Authority)
+        );
+        assert_eq!(store.version().unwrap(), before);
     }
 }
 
@@ -444,8 +817,15 @@ fn actual_mls_retry_receipt_and_uncertain_cancel_share_checkpoints() {
             .await
             .unwrap();
         let id = *prepared.prepared_message().unwrap().id();
-        let stale = invitation.threads().send(&mut a.port(), &mut Grant::new(), b"stale").await.unwrap();
-        assert_eq!(ad.outgoing(stale, &stale_contacts).err(), Some(cdlv::Error::Conflict));
+        let stale = invitation
+            .threads()
+            .send(&mut a.port(), &mut Grant::new(), b"stale")
+            .await
+            .unwrap();
+        assert_eq!(
+            ad.outgoing(stale, &stale_contacts).err(),
+            Some(cdlv::Error::Conflict)
+        );
         let candidate = ad.outgoing(prepared, &contacts(&a, &astore)).unwrap();
         assert_eq!(ad.status(&id), None);
         let sent = candidate
@@ -461,10 +841,42 @@ fn actual_mls_retry_receipt_and_uncertain_cancel_share_checkpoints() {
         assert_eq!(sent.delivery.status(&id), Some(Status::Pending));
         assert!(sent.threads.threads().history().is_empty());
         assert_eq!(sent.delivery.ack(&id).err(), Some(cdlv::Error::State));
-        assert_eq!(sent.delivery.retry(&id, &mut directory, &contacts(&a, &astore)).await.err(), Some(cdlv::Error::State));
-        assert_eq!(sent.delivery.wrap(&sent.threads.outgoing()[0], &mut a.keys, &bh, &mut directory, &mut astore, [70;32]).await.err(), Some(cdlv::Error::Scope));
+        assert_eq!(
+            sent.delivery
+                .retry(&id, &mut directory, &contacts(&a, &astore))
+                .await
+                .err(),
+            Some(cdlv::Error::State)
+        );
+        assert_eq!(
+            sent.delivery
+                .wrap(
+                    &sent.threads.outgoing()[0],
+                    &mut a.keys,
+                    &bh,
+                    &mut directory,
+                    &mut astore,
+                    [70; 32]
+                )
+                .await
+                .err(),
+            Some(cdlv::Error::Scope)
+        );
         let wrong_purpose = a.keys.key(cthr::purpose()).await.unwrap();
-        assert_eq!(sent.delivery.wrap(&sent.threads.outgoing()[0], &mut a.keys, &wrong_purpose, &mut directory, &mut astore, [70;32]).await.err(), Some(cdlv::Error::Scope));
+        assert_eq!(
+            sent.delivery
+                .wrap(
+                    &sent.threads.outgoing()[0],
+                    &mut a.keys,
+                    &wrong_purpose,
+                    &mut directory,
+                    &mut astore,
+                    [70; 32]
+                )
+                .await
+                .err(),
+            Some(cdlv::Error::Scope)
+        );
 
         let (ad, wire) = sent
             .delivery
@@ -479,11 +891,72 @@ fn actual_mls_retry_receipt_and_uncertain_cancel_share_checkpoints() {
             .await
             .unwrap();
         restored_record_refusals(&a, &astore).await;
-        assert_eq!(ad.wrap(&sent.threads.outgoing()[0], &mut a.keys, &ah, &mut directory, &mut astore, [70;32]).await.err(), Some(cdlv::Error::State));
-        assert_eq!(sent.delivery.cancel(&id, &mut astore, [70;32]).await.err(), Some(cdlv::Error::Conflict));
-        for (conversation, epoch) in [([18;32], 1), (SLOT,2)] {
-            let bad_ack = b.wire_claim(&bh,"alice",conversation,WireClaim::Ack{id,epoch}).await;
-            assert_eq!(ad.authenticate(&bad_ack,&mut directory,&contacts(&a,&astore)).await.err(), Some(cdlv::Error::Authority));
+        restored_capacity_and_duplicate_refusals(&mut a, &astore).await;
+        let (racing_backend, mut racing_store) = a.store().await;
+        let checkpoint = astore.read("cdlv", b"journal.v1").unwrap().unwrap();
+        racing_store
+            .commit(
+                0,
+                [1; 32],
+                &[cwst::Change::Put {
+                    owner: "cdlv",
+                    key: b"journal.v1",
+                    value: checkpoint,
+                }],
+                &[],
+            )
+            .await
+            .unwrap();
+        let racing_delivery = Delivery::load(a.binding.clone(), &racing_store).unwrap();
+        let cipher = ckmg::passkey::store_cipher(&prf(1), "alpha").unwrap();
+        let mut competing_store = Store::open(racing_backend, &cipher, "alpha").await.unwrap();
+        competing_store
+            .commit(competing_store.version().unwrap(), [2; 32], &[], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            racing_delivery
+                .cancel(&id, &mut racing_store, [3; 32])
+                .await
+                .err(),
+            Some(cdlv::Error::Storage)
+        );
+        let foreign_cipher = ckmg::passkey::store_cipher(&prf(1), "beta").unwrap();
+        let mut foreign_store = Store::create(Memory::new(), &foreign_cipher, "beta")
+            .await
+            .unwrap();
+        assert_eq!(
+            ad.cancel(&id, &mut foreign_store, [3; 32]).await.err(),
+            Some(cdlv::Error::Scope)
+        );
+
+        assert_eq!(
+            ad.wrap(
+                &sent.threads.outgoing()[0],
+                &mut a.keys,
+                &ah,
+                &mut directory,
+                &mut astore,
+                [70; 32]
+            )
+            .await
+            .err(),
+            Some(cdlv::Error::State)
+        );
+        assert_eq!(
+            sent.delivery.cancel(&id, &mut astore, [70; 32]).await.err(),
+            Some(cdlv::Error::Conflict)
+        );
+        for (conversation, epoch) in [([18; 32], 1), (SLOT, 2)] {
+            let bad_ack = b
+                .wire_claim(&bh, "alice", conversation, WireClaim::Ack { id, epoch })
+                .await;
+            assert_eq!(
+                ad.authenticate(&bad_ack, &mut directory, &contacts(&a, &astore))
+                    .await
+                    .err(),
+                Some(cdlv::Error::Authority)
+            );
         }
 
         let retry = ad
@@ -510,7 +983,74 @@ fn actual_mls_retry_receipt_and_uncertain_cancel_share_checkpoints() {
             Some(cdlv::Error::Authority)
         );
         directory.0.borrow_mut().insert("bob".into(), current);
+        let mut outsider = crossed_envelope_refusals(
+            (&mut a, &mut b),
+            (&astore, &bstore),
+            (&ah, &bh),
+            wire.bytes(),
+        )
+        .await;
+        restored_pending_scope_refusals(
+            &mut a,
+            &outsider,
+            &astore,
+            &sent.threads.outgoing()[0],
+            &ah,
+        )
+        .await;
         let bd = Delivery::load(b.binding.clone(), &bstore).unwrap();
+        assert_eq!(
+            bd.authenticate(wire.bytes(), &mut directory, &contacts(&a, &astore))
+                .await
+                .err(),
+            Some(cdlv::Error::Conflict)
+        );
+        let mut foreign: serde_json::Value = serde_json::from_slice(wire.bytes()).unwrap();
+        foreign["certificate"]["binding"] =
+            serde_json::to_value(Binding::new("beta", "alice").unwrap()).unwrap();
+        assert_eq!(
+            bd.authenticate(
+                &serde_json::to_vec(&foreign).unwrap(),
+                &mut directory,
+                &contacts(&b, &bstore)
+            )
+            .await
+            .err(),
+            Some(cdlv::Error::Scope)
+        );
+
+        let self_addressed = b
+            .wire_claim(&bh, "bob", SLOT, WireClaim::Ack { id, epoch: 1 })
+            .await;
+        assert_eq!(
+            bd.authenticate(&self_addressed, &mut directory, &contacts(&b, &bstore))
+                .await
+                .err(),
+            Some(cdlv::Error::Scope)
+        );
+        assert_eq!(
+            bd.wrap(
+                &sent.threads.outgoing()[0],
+                &mut a.keys,
+                &ah,
+                &mut directory,
+                &mut bstore,
+                [70; 32],
+            )
+            .await
+            .err(),
+            Some(cdlv::Error::Scope)
+        );
+        let foreign_candidate = joined
+            .threads()
+            .send(&mut b.port(), &mut Grant::new(), b"foreign owner")
+            .await
+            .unwrap();
+        assert_eq!(
+            ad.outgoing(foreign_candidate, &contacts(&a, &astore)).err(),
+            Some(cdlv::Error::Scope)
+        );
+
         for invalid in [vec![0], vec![0; 2 * 1024 * 1024 + 1]] {
             assert!(
                 bd.authenticate(&invalid, &mut directory, &contacts(&b, &bstore))
@@ -603,6 +1143,46 @@ fn actual_mls_retry_receipt_and_uncertain_cancel_share_checkpoints() {
                 Some(expected)
             );
         }
+        for case in 0..4 {
+            let Authenticated::Data(incoming) = bd
+                .authenticate(wire.bytes(), &mut directory, &contacts(&b, &bstore))
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            let prepared = if case == 2 {
+                joined
+                    .threads()
+                    .send(&mut b.port(), &mut Grant::new(), b"wrong direction")
+                    .await
+                    .unwrap()
+            } else {
+                joined
+                    .threads()
+                    .receive(&mut b.port(), &mut Grant::new(), incoming.ciphertext())
+                    .await
+                    .unwrap()
+            };
+            if case == 3 {
+                assert_eq!(
+                    bd.outgoing(prepared, &contacts(&b, &bstore)).err(),
+                    Some(cdlv::Error::Scope)
+                );
+                continue;
+            }
+            let handle = match case {
+                0 => &ah,
+                1 => &b.handle,
+                _ => &bh,
+            };
+            assert_eq!(
+                bd.received(prepared, incoming, &mut b.keys, handle)
+                    .await
+                    .err(),
+                Some(cdlv::Error::Scope)
+            );
+        }
         let incoming = match bd
             .authenticate(wire.bytes(), &mut directory, &contacts(&b, &bstore))
             .await
@@ -685,14 +1265,121 @@ fn actual_mls_retry_receipt_and_uncertain_cancel_share_checkpoints() {
             b"durable hello"
         );
         restored_record_refusals(&b, &bstore).await;
-        assert_eq!(received.delivery.retry(&id,&mut directory,&contacts(&b,&bstore)).await.err(),Some(cdlv::Error::State));
-        assert_eq!(received.delivery.cancel(&id,&mut bstore,[70;32]).await.err(),Some(cdlv::Error::State));
+        assert_eq!(
+            received
+                .delivery
+                .retry(&id, &mut directory, &contacts(&b, &bstore))
+                .await
+                .err(),
+            Some(cdlv::Error::State)
+        );
+        assert_eq!(
+            received
+                .delivery
+                .cancel(&id, &mut bstore, [70; 32])
+                .await
+                .err(),
+            Some(cdlv::Error::State)
+        );
+        let wrong_direction = a
+            .wire_claim(&ah, "bob", SLOT, WireClaim::Ack { id, epoch: 1 })
+            .await;
+        assert_eq!(
+            received
+                .delivery
+                .authenticate(&wrong_direction, &mut directory, &contacts(&b, &bstore))
+                .await
+                .err(),
+            Some(cdlv::Error::Authority)
+        );
+        let copied: serde_json::Value = serde_json::from_slice(wire.bytes()).unwrap();
+        let payload: Vec<u8> =
+            serde_json::from_value(copied["body"]["Data"]["wire"].clone()).unwrap();
+        let mut shadow = copied_store(&b, &bstore).await;
+        b.establish("charlie", &mut shadow).await;
+        let ch = outsider.keys.key(cdlv::purpose()).await.unwrap();
+        let repacked = outsider
+            .wire_claim(
+                &ch,
+                "bob",
+                SLOT,
+                WireClaim::Data {
+                    id,
+                    epoch: 1,
+                    wire: payload.clone(),
+                },
+            )
+            .await;
+        assert_eq!(
+            Delivery::load(b.binding.clone(), &shadow)
+                .unwrap()
+                .authenticate(&repacked, &mut directory, &contacts(&b, &shadow))
+                .await
+                .err(),
+            Some(cdlv::Error::Authority)
+        );
+        reopen(&mut b, "alice", &mut shadow).await;
+        let repacked = a
+            .wire_claim(
+                &ah,
+                "bob",
+                [18; 32],
+                WireClaim::Data {
+                    id,
+                    epoch: 1,
+                    wire: payload,
+                },
+            )
+            .await;
+        assert_eq!(
+            Delivery::load(b.binding.clone(), &shadow)
+                .unwrap()
+                .authenticate(&repacked, &mut directory, &contacts(&b, &shadow))
+                .await
+                .err(),
+            Some(cdlv::Error::Authority)
+        );
         let original_envelope: serde_json::Value = serde_json::from_slice(wire.bytes()).unwrap();
-        let original_payload: Vec<u8> = serde_json::from_value(original_envelope["body"]["Data"]["wire"].clone()).unwrap();
-        let wrong_epoch = a.wire_claim(&ah,"bob",SLOT,WireClaim::Data{id,epoch:2,wire:original_payload.clone()}).await;
-        assert_eq!(received.delivery.authenticate(&wrong_epoch,&mut directory,&contacts(&b,&bstore)).await.err(),Some(cdlv::Error::Authority));
-        let reversed = b.wire_claim(&bh,"alice",SLOT,WireClaim::Data{id,epoch:1,wire:original_payload}).await;
-        assert_eq!(ad.authenticate(&reversed,&mut directory,&contacts(&a,&astore)).await.err(),Some(cdlv::Error::Authority));
+        let original_payload: Vec<u8> =
+            serde_json::from_value(original_envelope["body"]["Data"]["wire"].clone()).unwrap();
+        let wrong_epoch = a
+            .wire_claim(
+                &ah,
+                "bob",
+                SLOT,
+                WireClaim::Data {
+                    id,
+                    epoch: 2,
+                    wire: original_payload.clone(),
+                },
+            )
+            .await;
+        assert_eq!(
+            received
+                .delivery
+                .authenticate(&wrong_epoch, &mut directory, &contacts(&b, &bstore))
+                .await
+                .err(),
+            Some(cdlv::Error::Authority)
+        );
+        let reversed = b
+            .wire_claim(
+                &bh,
+                "alice",
+                SLOT,
+                WireClaim::Data {
+                    id,
+                    epoch: 1,
+                    wire: original_payload,
+                },
+            )
+            .await;
+        assert_eq!(
+            ad.authenticate(&reversed, &mut directory, &contacts(&a, &astore))
+                .await
+                .err(),
+            Some(cdlv::Error::Authority)
+        );
 
         let ack = received.delivery.ack(&id).unwrap();
         let bcipher = ckmg::passkey::store_cipher(&prf(2), "alpha").unwrap();
@@ -745,6 +1432,20 @@ fn actual_mls_retry_receipt_and_uncertain_cancel_share_checkpoints() {
                 .err(),
             Some(cdlv::Error::State)
         );
+        let Authenticated::Ack(foreign_ack) = ad
+            .authenticate(&ack_bytes, &mut directory, &contacts(&a, &astore))
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            received
+                .delivery
+                .acknowledged(sent.threads.threads(), foreign_ack)
+                .err(),
+            Some(cdlv::Error::Scope)
+        );
         let ack = match ad
             .authenticate(ack.bytes(), &mut directory, &contacts(&a, &astore))
             .await
@@ -781,6 +1482,23 @@ fn actual_mls_retry_receipt_and_uncertain_cancel_share_checkpoints() {
             .await
             .unwrap();
         assert_eq!(accepted.delivery.status(&id), Some(Status::Accepted));
+        restored_record_refusals(&a, &astore).await;
+        assert_eq!(
+            accepted
+                .delivery
+                .wrap(
+                    &sent.threads.outgoing()[0],
+                    &mut a.keys,
+                    &ah,
+                    &mut directory,
+                    &mut astore,
+                    [70; 32]
+                )
+                .await
+                .err(),
+            Some(cdlv::Error::Authority)
+        );
+
         match accepted
             .delivery
             .authenticate(&ack_bytes, &mut directory, &contacts(&a, &astore))
@@ -791,7 +1509,82 @@ fn actual_mls_retry_receipt_and_uncertain_cancel_share_checkpoints() {
             _ => panic!("duplicate ACK must not advance sender history"),
         }
         assert_eq!(accepted.threads.threads().history().len(), 1);
+        // The real MLS checkpoint can fit while the signed retry journal's
+        // nested wire encoding exceeds Store's per-value limit. No bytes escape.
+        let large = accepted
+            .threads
+            .threads()
+            .send(&mut a.port(), &mut Grant::new(), &vec![0; 200_000])
+            .await
+            .unwrap();
+        let large = accepted
+            .delivery
+            .outgoing(large, &contacts(&a, &astore))
+            .unwrap()
+            .commit(
+                &mut a.port(),
+                &mut Grant::new(),
+                &mut directory,
+                &mut astore,
+                [71; 32],
+            )
+            .await
+            .unwrap();
+        let before = astore.version().unwrap();
+        assert_eq!(
+            large
+                .delivery
+                .wrap(
+                    &large.threads.outgoing()[0],
+                    &mut a.keys,
+                    &ah,
+                    &mut directory,
+                    &mut astore,
+                    [72; 32]
+                )
+                .await
+                .err(),
+            Some(cdlv::Error::Limit)
+        );
+        assert_eq!(astore.version().unwrap(), before);
+        let held = Threads::load(a.binding.clone(), SLOT, &astore)
+            .unwrap()
+            .send(&mut a.port(), &mut Grant::new(), b"held before close")
+            .await
+            .unwrap();
+        let held = Delivery::load(a.binding.clone(), &astore)
+            .unwrap()
+            .outgoing(held, &contacts(&a, &astore))
+            .unwrap();
         a.control("bob", ctcs::Action::Close, &mut astore, 91).await;
+        assert_eq!(
+            held.commit(
+                &mut a.port(),
+                &mut Grant::new(),
+                &mut directory,
+                &mut astore,
+                [73; 32],
+            )
+            .await
+            .err(),
+            Some(cdlv::Error::Conflict)
+        );
+        assert_eq!(
+            large
+                .delivery
+                .wrap(
+                    &large.threads.outgoing()[0],
+                    &mut a.keys,
+                    &ah,
+                    &mut directory,
+                    &mut astore,
+                    [74; 32],
+                )
+                .await
+                .err(),
+            Some(cdlv::Error::Conflict)
+        );
+
         a.control(
             "bob",
             ctcs::Action::Reopen {
