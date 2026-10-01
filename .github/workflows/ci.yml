@@ -27,6 +27,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Check committed dependency declarations and lock
+        run: python3 .github/check-first-party.py
       - uses: dtolnay/rust-toolchain@stable
       - run: |
           rustc -Vv > resolver.txt
@@ -117,7 +119,7 @@ jobs:
       - run: cargo deny --locked check advisories
 
   coverage:
-    needs: check
+    needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -140,7 +142,7 @@ jobs:
           tool: cargo-llvm-cov
       - run: cargo llvm-cov --locked --branch --no-cfg-coverage --no-cfg-coverage-nightly --json --output-path coverage.json --ignore-filename-regex '/tests/'
       - run: cargo llvm-cov report --locked --branch --ignore-filename-regex '/tests/' --lcov --output-path coverage.lcov
-      - run: cargo llvm-cov report --locked --branch --ignore-filename-regex '/tests/' --text --show-line-counts-or-regions --show-instantiations=false --output-path coverage.txt
+      - run: cargo llvm-cov report --locked --branch --ignore-filename-regex '/tests/' --text --output-path coverage.txt
       - run: |
           python3 .github/test-source-coverage.py
           python3 .github/check-source-coverage.py coverage.lcov coverage.json coverage.txt

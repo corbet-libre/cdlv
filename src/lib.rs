@@ -20,12 +20,13 @@ pub enum Error {
     Conflict,
     Storage,
     State,
+    Threads(cthr::Error),
 }
 const OWNER: &str = "cdlv";
 const KEY: &[u8] = b"journal.v1";
 const MAX_WIRE: usize = 2 * 1024 * 1024;
 const MAX_RECORDS: usize = 1024;
-const MAX_JOURNAL: usize = 8 * 1024 * 1024;
+const MAX_JOURNAL: usize = cwst::MAX_VALUE_BYTES;
 pub fn purpose() -> Purpose {
     Purpose::new(Scope::Device, "cdlv.delivery", 1).expect("static purpose")
 }
@@ -66,7 +67,7 @@ impl Envelope {
         body: &Body,
     ) -> Result<Vec<u8>> {
         serde_json::to_vec(&("cdlv.envelope.v1", certificate, peer, conversation, body))
-            .map_err(|_| Error::Encoding)
+            .map_err(encoding_error)
     }
     fn id(&self) -> &[u8; 32] {
         match &self.body {
@@ -86,14 +87,14 @@ impl Envelope {
         {
             return Err(Error::Scope);
         }
-        Binding::new(self.certificate.binding.community(), &self.peer).map_err(|_| Error::Scope)?;
+        Binding::new(self.certificate.binding.community(), &self.peer).map_err(scope_error)?;
         let current = devices
             .current(&self.certificate.binding)
             .await
-            .map_err(|_| Error::Authority)?;
+            .map_err(authority_error)?;
         self.certificate
             .verify(&current, &purpose())
-            .map_err(|_| Error::Authority)?;
+            .map_err(authority_error)?;
         ckmg::verify(
             &self.certificate.key,
             &Self::transcript(
@@ -104,9 +105,10 @@ impl Envelope {
             )?,
             &self.signature,
         )
-        .map_err(|_| Error::Authority)?;
+        .map_err(authority_error)?;
         if let Body::Data { id, wire, .. } = &self.body {
-            if wire.is_empty() || wire.len() > MAX_WIRE / 2 {
+            // The bounded JSON byte-array envelope already limits this payload.
+            if wire.is_empty() {
                 return Err(Error::Limit);
             }
             if ckmg::hash(wire).value() != id {
@@ -133,7 +135,7 @@ async fn sign<S: SecureStore, C: Clock, R: Entropy, A: Authority>(
             &Envelope::transcript(&certificate, &peer, &conversation, &body)?,
         )
         .await
-        .map_err(|_| Error::Authority)?;
+        .map_err(authority_error)?;
     Ok(Envelope {
         version: 1,
         certificate,
@@ -156,6 +158,38 @@ struct Record {
     wire: Option<Vec<u8>>,
     ack: Option<Envelope>,
 }
+impl Record {
+    fn envelope_matches(
+        &self,
+        envelope: &Envelope,
+        sender: &Binding,
+        recipient: &Binding,
+    ) -> Result<()> {
+        if envelope.version != 1
+            || &envelope.certificate.binding != sender
+            || envelope.certificate.purpose != purpose()
+            || envelope.peer != recipient.member()
+            || envelope.conversation != self.conversation
+            || envelope.id() != &self.id
+            || envelope.epoch() != self.epoch
+        {
+            return Err(Error::Encoding);
+        }
+        // Historical receipts stay valid after rotation; this checks the exact
+        // retained signature, while publication/retry separately checks lineage.
+        ckmg::verify(
+            &envelope.certificate.key,
+            &Envelope::transcript(
+                &envelope.certificate,
+                &envelope.peer,
+                &envelope.conversation,
+                &envelope.body,
+            )?,
+            &envelope.signature,
+        )
+        .map_err(authority_error)
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Journal {
@@ -174,17 +208,18 @@ pub struct Delivery {
 /// Authentic bytes remain unaccepted until real Threads decryption and the
 /// combined recipient checkpoint have succeeded.
 pub struct Incoming {
-    envelope: Envelope,
+    certificate: KeyCertificate,
+    conversation: [u8; 32],
+    id: [u8; 32],
+    epoch: u64,
+    wire: Vec<u8>,
 }
 impl Incoming {
     pub fn ciphertext(&self) -> &[u8] {
-        match &self.envelope.body {
-            Body::Data { wire, .. } => wire,
-            _ => unreachable!("Incoming is only constructed for Data"),
-        }
+        &self.wire
     }
     pub fn conversation(&self) -> &[u8; 32] {
-        &self.envelope.conversation
+        &self.conversation
     }
 }
 /// The recipient signed this only after preparing its real MLS acceptance.
@@ -246,16 +281,13 @@ impl Delivery {
         if !store.is_scope(binding.community()) {
             return Err(Error::Scope);
         }
-        let expected = store.version().map_err(|_| Error::Storage)?;
+        let expected = store.version().map_err(storage_error)?;
         let base = store
             .read(OWNER, KEY)
             .expect("immutable store and static key checked")
             .map(<[u8]>::to_vec);
-        if base.as_ref().is_some_and(|bytes| bytes.len() > MAX_JOURNAL) {
-            return Err(Error::Limit);
-        }
         let journal = match &base {
-            Some(bytes) => serde_json::from_slice::<Journal>(bytes).map_err(|_| Error::Encoding)?,
+            Some(bytes) => serde_json::from_slice::<Journal>(bytes).map_err(encoding_error)?,
             None => Journal {
                 version: 1,
                 binding: binding.clone(),
@@ -276,9 +308,40 @@ impl Delivery {
             {
                 return Err(Error::Encoding);
             }
-            Binding::new(binding.community(), &record.peer).map_err(|_| Error::Encoding)?;
+            let peer = Binding::new(binding.community(), &record.peer).map_err(encoding_error)?;
+            let expected_purpose = if record.outgoing {
+                cthr::purpose()
+            } else {
+                purpose()
+            };
+            if record.peer_certificate.binding != peer
+                || record.peer_certificate.purpose != expected_purpose
+            {
+                return Err(Error::Encoding);
+            }
+            if !record.outgoing && (record.status != Status::Accepted || record.wire.is_some()) {
+                return Err(Error::Encoding);
+            }
             if record.status == Status::Accepted && record.ack.is_none() {
                 return Err(Error::Encoding);
+            }
+            if let Some(wire) = &record.wire {
+                let envelope: Envelope = serde_json::from_slice(wire).map_err(encoding_error)?;
+                if !matches!(envelope.body, Body::Data { .. }) {
+                    return Err(Error::Encoding);
+                }
+                record.envelope_matches(&envelope, &binding, &peer)?;
+            }
+            if let Some(ack) = &record.ack {
+                if record.status != Status::Accepted || !matches!(ack.body, Body::Ack { .. }) {
+                    return Err(Error::Encoding);
+                }
+                let (sender, recipient) = if record.outgoing {
+                    (&peer, &binding)
+                } else {
+                    (&binding, &peer)
+                };
+                record.envelope_matches(ack, sender, recipient)?;
             }
         }
         Ok(Self {
@@ -290,12 +353,15 @@ impl Delivery {
     pub fn status(&self, id: &[u8; 32]) -> Option<Status> {
         self.journal.records.get(&id_key(id)).map(|r| r.status)
     }
-    fn contacts(&self, contacts: &Contacts, peer: &str) -> Result<()> {
+    fn contacts(&self, contacts: &Contacts, peer: &str, conversation: &[u8; 32]) -> Result<()> {
         if contacts.binding() != &self.journal.binding || contacts.version() != self.expected {
             return Err(Error::Conflict);
         }
         // Waves owns first-contact release; there is no accepting substitute.
-        if contacts.relation(peer).map_err(|_| Error::Scope)?.state != ctcs::State::Established {
+        let relation = contacts.relation(peer).map_err(scope_error)?;
+        if relation.state != ctcs::State::Established
+            || relation.conversation.as_ref() != Some(conversation)
+        {
             return Err(Error::Unavailable);
         }
         Ok(())
@@ -309,29 +375,43 @@ impl Delivery {
         if wire.is_empty() || wire.len() > MAX_WIRE {
             return Err(Error::Limit);
         }
-        let envelope: Envelope = serde_json::from_slice(wire).map_err(|_| Error::Encoding)?;
+        let envelope: Envelope = serde_json::from_slice(wire).map_err(encoding_error)?;
         if envelope.certificate.binding.community() != self.journal.binding.community()
             || envelope.peer != self.journal.binding.member()
         {
             return Err(Error::Scope);
         }
         envelope.verify(devices).await?;
-        match &envelope.body {
-            Body::Data { .. } => {
-                self.contacts(contacts, envelope.certificate.binding.member())?;
-                if let Some(record) = self.journal.records.get(&id_key(envelope.id())) {
+        match envelope {
+            Envelope {
+                certificate,
+                conversation,
+                body: Body::Data { id, epoch, wire },
+                ..
+            } => {
+                self.contacts(contacts, certificate.binding.member(), &conversation)?;
+                if let Some(record) = self.journal.records.get(&id_key(&id)) {
                     if record.outgoing
-                        || record.peer != envelope.certificate.binding.member()
-                        || record.conversation != envelope.conversation
-                        || record.epoch != envelope.epoch()
+                        || record.peer != certificate.binding.member()
+                        || record.conversation != conversation
+                        || record.epoch != epoch
                     {
                         return Err(Error::Authority);
                     }
-                    return self.ack(envelope.id()).map(Authenticated::Duplicate);
+                    return self.ack(&id).map(Authenticated::Duplicate);
                 }
-                Ok(Authenticated::Data(Incoming { envelope }))
+                Ok(Authenticated::Data(Incoming {
+                    certificate,
+                    conversation,
+                    id,
+                    epoch,
+                    wire,
+                }))
             }
-            Body::Ack { .. } => {
+            envelope @ Envelope {
+                body: Body::Ack { .. },
+                ..
+            } => {
                 let record = self
                     .journal
                     .records
@@ -387,7 +467,7 @@ impl Delivery {
     pub fn outgoing(&self, threads: cthr::Candidate, contacts: &Contacts) -> Result<Candidate> {
         let proposed = threads.prepared_message().ok_or(Error::State)?;
         let peer = proposed.peer().ok_or(Error::Unavailable)?.to_owned();
-        self.contacts(contacts, &peer)?;
+        self.contacts(contacts, &peer, proposed.conversation())?;
         let peer_certificate = proposed.peer_certificate().ok_or(Error::Authority)?;
         let record = Record {
             peer,
@@ -412,25 +492,24 @@ impl Delivery {
         if handle.certificate().binding != self.journal.binding {
             return Err(Error::Scope);
         }
-        let envelope = incoming.envelope;
-        let peer = envelope.certificate.binding.member().to_owned();
+        let peer = incoming.certificate.binding.member().to_owned();
         let ack = sign(
             keys,
             handle,
             peer.clone(),
-            envelope.conversation,
+            incoming.conversation,
             Body::Ack {
-                id: *envelope.id(),
-                epoch: envelope.epoch(),
+                id: incoming.id,
+                epoch: incoming.epoch,
             },
         )
         .await?;
         let record = Record {
             peer,
-            peer_certificate: envelope.certificate.clone(),
-            conversation: envelope.conversation,
-            id: *envelope.id(),
-            epoch: envelope.epoch(),
+            peer_certificate: incoming.certificate,
+            conversation: incoming.conversation,
+            id: incoming.id,
+            epoch: incoming.epoch,
             outgoing: false,
             status: Status::Accepted,
             wire: None,
@@ -444,9 +523,7 @@ impl Delivery {
             return Err(Error::Scope);
         }
         let id = *ack.envelope.id();
-        let candidate = threads
-            .acknowledge(&id, &ack)
-            .map_err(|_| Error::Authority)?;
+        let candidate = threads.acknowledge(&id, &ack).map_err(Error::Threads)?;
         let mut journal = self.journal.clone();
         let record = journal.records.get_mut(&id_key(&id)).ok_or(Error::State)?;
         record.status = Status::Accepted;
@@ -491,17 +568,18 @@ impl Delivery {
             return Err(Error::State);
         }
         self.contacts(
-            &Contacts::load(self.journal.binding.clone(), store).map_err(|_| Error::Storage)?,
+            &Contacts::load(self.journal.binding.clone(), store).map_err(storage_error)?,
             &record.peer,
+            &record.conversation,
         )?;
         let current = devices
             .current(&record.peer_certificate.binding)
             .await
-            .map_err(|_| Error::Authority)?;
+            .map_err(authority_error)?;
         record
             .peer_certificate
             .verify(&current, &cthr::purpose())
-            .map_err(|_| Error::Authority)?;
+            .map_err(authority_error)?;
         let envelope = sign(
             keys,
             handle,
@@ -514,7 +592,7 @@ impl Delivery {
             },
         )
         .await?;
-        let wire = serde_json::to_vec(&envelope).map_err(|_| Error::Encoding)?;
+        let wire = serde_json::to_vec(&envelope).map_err(encoding_error)?;
         record.wire = Some(wire.clone());
         let committed = self.persist(journal, store, operation).await?;
         Ok((committed, Wire(wire)))
@@ -531,9 +609,9 @@ impl Delivery {
         if !record.outgoing || record.status != Status::Pending {
             return Err(Error::State);
         }
-        self.contacts(contacts, &record.peer)?;
+        self.contacts(contacts, &record.peer, &record.conversation)?;
         let wire = record.wire.as_ref().ok_or(Error::State)?;
-        let envelope: Envelope = serde_json::from_slice(wire).map_err(|_| Error::Encoding)?;
+        let envelope: Envelope = serde_json::from_slice(wire).map_err(encoding_error)?;
         envelope.verify(devices).await?;
         // The peer must also remain current; its purpose certificate is checked
         // by Threads before enqueue and incoming ACK verification. The owner
@@ -541,11 +619,11 @@ impl Delivery {
         let current = devices
             .current(&record.peer_certificate.binding)
             .await
-            .map_err(|_| Error::Authority)?;
+            .map_err(authority_error)?;
         record
             .peer_certificate
             .verify(&current, &cthr::purpose())
-            .map_err(|_| Error::Authority)?;
+            .map_err(authority_error)?;
         Ok(Wire(wire.clone()))
     }
     pub fn ack(&self, id: &[u8; 32]) -> Result<Wire> {
@@ -554,8 +632,7 @@ impl Delivery {
             return Err(Error::State);
         }
         Ok(Wire(
-            serde_json::to_vec(record.ack.as_ref().ok_or(Error::State)?)
-                .map_err(|_| Error::Encoding)?,
+            serde_json::to_vec(record.ack.as_ref().ok_or(Error::State)?).map_err(encoding_error)?,
         ))
     }
     pub async fn cancel<B: Backend>(
@@ -592,7 +669,7 @@ impl Delivery {
                 &[],
             )
             .await
-            .map_err(|_| Error::Storage)?;
+            .map_err(storage_error)?;
         Ok(Self {
             journal,
             expected,
@@ -603,7 +680,7 @@ impl Delivery {
         if !store.is_scope(self.journal.binding.community()) {
             return Err(Error::Scope);
         }
-        if store.read(OWNER, KEY).map_err(|_| Error::Storage)? != self.base.as_deref() {
+        if store.read(OWNER, KEY).map_err(storage_error)? != self.base.as_deref() {
             return Err(Error::Conflict);
         }
         Ok(())
@@ -632,9 +709,9 @@ impl Candidate {
             .ok_or(Error::State)?;
         if self.requires_contact {
             prior.contacts(
-                &Contacts::load(prior.journal.binding.clone(), store)
-                    .map_err(|_| Error::Storage)?,
+                &Contacts::load(prior.journal.binding.clone(), store).map_err(storage_error)?,
                 &record.peer,
+                &record.conversation,
             )?;
         }
         if let Some(ack) = &record.ack {
@@ -643,7 +720,7 @@ impl Candidate {
         let current = devices
             .current(&record.peer_certificate.binding)
             .await
-            .map_err(|_| Error::Authority)?;
+            .map_err(authority_error)?;
         let expected_purpose = if record.outgoing {
             cthr::purpose()
         } else {
@@ -652,7 +729,7 @@ impl Candidate {
         record
             .peer_certificate
             .verify(&current, &expected_purpose)
-            .map_err(|_| Error::Authority)?;
+            .map_err(authority_error)?;
         let bytes = encode_journal(&prior.journal)?;
         let threads = self
             .threads
@@ -668,16 +745,30 @@ impl Candidate {
                 }],
             )
             .await
-            .map_err(|_| Error::Storage)?;
+            .map_err(Error::Threads)?;
         let delivery = Delivery::load(prior.journal.binding, store)?;
         Ok(Committed { threads, delivery })
     }
 }
 
 fn encode_journal(journal: &Journal) -> Result<Vec<u8>> {
-    let bytes = serde_json::to_vec(journal).map_err(|_| Error::Encoding)?;
+    let bytes = serde_json::to_vec(journal).map_err(encoding_error)?;
     if bytes.len() > MAX_JOURNAL {
         return Err(Error::Limit);
     }
     Ok(bytes)
+}
+
+// Keep the boundary's coarse upstream error classification consistent.
+fn encoding_error<E>(_: E) -> Error {
+    Error::Encoding
+}
+fn authority_error<E>(_: E) -> Error {
+    Error::Authority
+}
+fn storage_error<E>(_: E) -> Error {
+    Error::Storage
+}
+fn scope_error<E>(_: E) -> Error {
+    Error::Scope
 }

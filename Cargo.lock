@@ -471,7 +471,7 @@ dependencies = [
 [[package]]
 name = "ctcs"
 version = "0.1.0"
-source = "git+https://github.com/corbet-foss/ctcs?branch=main#5f29033fc269e988d56fafb78d417ad6834fc893"
+source = "git+https://github.com/corbet-foss/ctcs?branch=main#5a66c1f9fe6b9e0476c1e82660bd5818f59e5a28"
 dependencies = [
  "ckmg",
  "cwst",
@@ -483,7 +483,7 @@ dependencies = [
 [[package]]
 name = "cthr"
 version = "0.1.0"
-source = "git+https://github.com/corbet-foss/cthr?branch=main#9c55ad438a88a3480b929247d27cfd06f999f4bc"
+source = "git+https://github.com/corbet-foss/cthr?branch=main#dd96842cd15c10eb8c902c8f0e90caccb031ada8"
 dependencies = [
  "cgrp",
  "ckmg",
@@ -566,7 +566,7 @@ dependencies = [
 [[package]]
 name = "cwst"
 version = "0.0.0"
-source = "git+https://github.com/corbet-foss/cwst?branch=main#1e3b964468aa9c18ab933842767008fadcbfc87e"
+source = "git+https://github.com/corbet-foss/cwst?branch=main#f1681ebb167f3d3328f994a6e5d8d5c44f5e68ea"
 dependencies = [
  "atomicwrites",
  "blake3",

@@ -41,4 +41,14 @@ An authenticated duplicate Data envelope returns the exact persisted ACK without
 calling MLS again. An authenticated duplicate ACK returns AlreadyAccepted without
 changing history or the store version. Fresh Contacts and device checks still run
 before duplicate Data releases an ACK. Journals are bounded to 1024 records and
-8 MiB; oversized restored or proposed journals fail before publication.
+Store's per-value byte limit; the authenticated Store bounds restored bytes and
+oversized proposed journals fail before publication. The current established
+Contacts conversation must equal the MLS conversation at enqueue, receive, retry
+and publication. Reopening into a fresh conversation cannot revive an old MLS
+session.
+
+Incoming is a sealed data capability with concrete ciphertext fields, so an ACK
+cannot reach its ciphertext getter. Threads refusals keep their original typed
+error instead of being reported as a storage failure. The complete wire envelope
+is byte-bounded before parsing; JSON byte-array encoding necessarily bounds its
+inner payload more tightly, so there is no redundant larger inner allocation cap.

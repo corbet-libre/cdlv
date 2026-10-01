@@ -18,6 +18,9 @@ def check(lcov, raw, root, annotated=ANNOTATED):
 
 
 class GateTests(unittest.TestCase):
+    def test_upstream_single_file_format_has_no_filename_header(self):
+        check(LCOV, RAW, ROOT, annotated=ANNOTATED.split('\n', 1)[1])
+
     def test_complete_source_coverage(self):
         check(LCOV, RAW, ROOT)
 

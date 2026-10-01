@@ -100,6 +100,13 @@ def check(lcov, raw_json, root, annotated=None):
     # and therefore cannot detect a deleted DA record reliably.
     annotated_lines, annotated_files = {}, set()
     current = None
+    # llvm-cov omits its filename header when exactly one file is reported.
+    # Bind that format to the independently checked single-file raw inventory.
+    if not any(row.endswith('.rs:') and row.startswith('/') for row in annotated.splitlines()):
+        if len(expected) != 1:
+            raise ValueError('Missing annotated filenames for multiple sources')
+        current = next(iter(expected))
+        annotated_files.add(current)
     for record in annotated.splitlines():
         if record.endswith('.rs:') and record.startswith('/'):
             current = source_path(record[:-1])

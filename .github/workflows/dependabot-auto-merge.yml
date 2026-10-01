@@ -40,10 +40,12 @@ jobs:
                 jobs.some(j => j.status !== 'completed' || j.conclusion !== 'success')) {
               throw new Error('Substantive CI jobs are missing or not successful');
             }
-            // workflow_run.pull_requests may be empty even for a PR run.
-            const candidates = await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit, {
-              owner, repo, commit_sha: run.head_sha, per_page: 100
-            });
+            // workflow_run can omit PR associations, including for Dependabot.
+            const candidates = run.pull_requests?.length ? run.pull_requests :
+              await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit, {
+                owner, repo, commit_sha: run.head_sha, per_page: 100
+              });
+            if (!candidates.length) throw new Error('No pull request metadata for the tested head');
             for (const candidate of candidates) {
               const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number: candidate.number});
               if (pr.user.login !== 'dependabot[bot]' || pr.state !== 'open' || pr.draft ||
