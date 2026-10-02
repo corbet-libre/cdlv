@@ -1,0 +1,18 @@
+schema = 1
+project = "cdlv"
+
+[checks.native]
+kind = "commands"
+commands = [["bash", ".ci/check.sh", "native"]]
+
+[checks.browser]
+kind = "commands"
+commands = [["bash", ".ci/check.sh", "browser"]]
+
+[checks.coverage]
+kind = "commands"
+commands = [["bash", ".ci/check.sh", "coverage"]]
+
+[checks.dependency-policy]
+kind = "commands"
+commands = [["bash", ".ci/check.sh", "dependency-policy"]]
