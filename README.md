@@ -4,28 +4,25 @@ Authenticated message delivery and recipient acceptance on member devices.
 
 ## Scope
 
-Own live/offline delivery sessions, stable message IDs, pending outbox, retry,
-recipient ACK/refusal and accepted-delivery evidence. Consume committed Threads
-ciphertext, existing Mesh messages and opaque Records. Checkpoint candidate MLS,
-Delivery and outputs together before publication or ACK.
+### Purpose
 
-Never decide Wave outcomes, identity, membership or accounting. Never treat a
-transport return as acceptance, create an operator mailbox, or add a second Tor
-or frame layer. First contacts stay live; offline retains established encrypted
-pending messages without promising retention.
+Carries committed Threads ciphertext to recipients live over Mesh, or as sealed Records for existing contacts who are away, with receipts and retries.
 
-**States.** Disconnected → Authenticating → Live; pending ciphertext becomes
-queued/stored/sent, acknowledged, unavailable, failed or cancelled. The current
-journal exposes Pending, Accepted and CanceledUnconfirmed; transport states await
-real adapters. ACK and DHT storage never imply Answer.
+### Owns
 
-**Ports.** Threads candidates and committed outputs, Keys custody and current
-device authority, Contacts, encrypted Store, Mesh messages and opaque Records.
+Authenticated sessions, stable message identifiers, pending outbox, retry and cancellation, recipient acknowledgement or refusal, and offline queueing through Records.
 
-**Invariants and tests.** Private history stays on members' devices. Real Tor and
-DHT roundtrips, duplicate/lost-ACK restart, commit-before-ACK, block/revocation,
-retention failure and operator-storage inspection are required for full scope.
-Data owners compress and pad with Compression before Records encrypts.
+### Never
+
+Does not advance balances on acknowledgement, invent contact consent, permit offline first contact, treat a stored record as recipient acceptance, keep an operator mailbox, or add a second framing or transport layer.
+
+### States
+
+Disconnected to Authenticating to Live; each output moves from Pending to queued offline, stored, or sent, then to acknowledged, or to unavailable, failed, or cancelled.
+
+### Test obligations
+
+Real live and Records-backed offline round trips; duplicates and lost acknowledgements still yield one history item; acknowledgement follows committed history; blocking and revocation stop new acceptance; queued writes survive restart; evicted replicas report failure, never false delivery; operator storage inspection shows no message kept there. Native and Wasm builds share identical test vectors; state machines use injected clock, randomness, storage, and network; full line and branch coverage uses real round trips with injected delay, duplication, loss, cancellation, clock regression, corruption, and storage conflicts; acknowledgement follows durable acceptance with reconciliation of unknown outcomes; keys, sessions, stores, and locators stay isolated per community; sizes and work are bounded and errors omit identifiers, plaintext, and secrets; maintained third-party code only with no own crypto; outbound requests carry no personal identifiers.
 
 ## Reuse and status
 
