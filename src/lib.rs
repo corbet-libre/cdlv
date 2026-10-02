@@ -551,10 +551,10 @@ impl Delivery {
         {
             return Err(Error::Scope);
         }
-        let mut journal = self.journal.clone();
-        let record = journal
+        let record = self
+            .journal
             .records
-            .get_mut(&id_key(outgoing.id()))
+            .get(&id_key(outgoing.id()))
             .ok_or(Error::State)?;
         if record.status != Status::Pending
             || !record.outgoing
@@ -564,7 +564,66 @@ impl Delivery {
         {
             return Err(Error::Authority);
         }
-        if record.wire.is_some() {
+        self.wrap_payload(
+            outgoing.id(),
+            outgoing.bytes(),
+            (keys, handle, devices),
+            store,
+            operation,
+        )
+        .await
+    }
+    /// Recover a committed send after a crash before its signed envelope existed.
+    /// Only the original authenticated Storage outbox can supply the ciphertext;
+    /// no new MLS send, generation or message identifier is created.
+    pub async fn resume_wrap<S: SecureStore, C: Clock, R: Entropy, A: Authority, B: Backend>(
+        &self,
+        id: &[u8; 32],
+        keys: &mut Keys<S, C, R, A>,
+        handle: &KeyHandle,
+        devices: &mut impl DeviceAuthority,
+        store: &mut Store<B>,
+        operation: [u8; 32],
+    ) -> Result<(Self, Wire)> {
+        self.check_base(store)?;
+        let record = self.journal.records.get(&id_key(id)).ok_or(Error::State)?;
+        let bytes = store
+            .load_pending()
+            .map_err(storage_error)?
+            .iter()
+            .find_map(
+                |output| match serde_json::from_slice::<cthr::Event>(&output.bytes) {
+                    Ok(cthr::Event::Ciphertext {
+                        id: stored,
+                        epoch,
+                        bytes,
+                    }) if stored == *id
+                        && epoch == record.epoch
+                        && ckmg::hash(&bytes).value() == id =>
+                    {
+                        Some(bytes)
+                    }
+                    _ => None,
+                },
+            )
+            .ok_or(Error::State)?;
+        self.wrap_payload(id, &bytes, (keys, handle, devices), store, operation)
+            .await
+    }
+    async fn wrap_payload<S: SecureStore, C: Clock, R: Entropy, A: Authority, B: Backend>(
+        &self,
+        id: &[u8; 32],
+        payload: &[u8],
+        (keys, handle, devices): (&mut Keys<S, C, R, A>, &KeyHandle, &mut impl DeviceAuthority),
+        store: &mut Store<B>,
+        operation: [u8; 32],
+    ) -> Result<(Self, Wire)> {
+        if handle.certificate().binding != self.journal.binding {
+            return Err(Error::Scope);
+        }
+        let mut journal = self.journal.clone();
+        let record = journal.records.get_mut(&id_key(id)).ok_or(Error::State)?;
+        if !record.outgoing || record.status != Status::Pending || record.wire.is_some() {
             return Err(Error::State);
         }
         self.contacts(
@@ -588,7 +647,7 @@ impl Delivery {
             Body::Data {
                 id: record.id,
                 epoch: record.epoch,
-                wire: outgoing.bytes().to_vec(),
+                wire: payload.to_vec(),
             },
         )
         .await?;

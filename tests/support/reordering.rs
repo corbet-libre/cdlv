@@ -76,10 +76,35 @@ fn two_pending_reverse_order_delayed_acks_survive_reopen() {
             .await
             .unwrap();
         assert!(sent1.threads.threads().history().is_empty());
-        let (_, wire1) = sent1
-            .delivery
-            .wrap(
-                &sent1.threads.outgoing()[0],
+        // Crash after committing the MLS send but before signing its envelope.
+        // The durable outbox, not a copied live ratchet, recovers this send.
+        let original_ciphertext = sent1.threads.outgoing()[0].bytes().to_vec();
+        let original_epoch = sent1.threads.outgoing()[0].epoch();
+        drop(sent1);
+        drop(astore);
+        let mut astore = Store::open(abackend.clone(), &acipher, "alpha")
+            .await
+            .unwrap();
+        recovery_refusals(
+            &mut a,
+            &b,
+            &astore,
+            id1,
+            original_epoch,
+            &original_ciphertext,
+            &mut directory,
+        )
+        .await;
+        let restored = Delivery::load(a.binding.clone(), &astore).unwrap();
+        assert!(
+            restored
+                .retry(&id1, &mut directory, &contacts(&a, &astore))
+                .await
+                .is_err()
+        );
+        let (_, wire1) = restored
+            .resume_wrap(
+                &id1,
                 &mut a.keys,
                 &ah,
                 &mut directory,
@@ -88,6 +113,24 @@ fn two_pending_reverse_order_delayed_acks_survive_reopen() {
             )
             .await
             .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(wire1.bytes()).unwrap();
+        let recovered_ciphertext: Vec<u8> =
+            serde_json::from_value(envelope["body"]["Data"]["wire"].clone()).unwrap();
+        assert_eq!(recovered_ciphertext, original_ciphertext);
+        let wrapped = Delivery::load(a.binding.clone(), &astore).unwrap();
+        assert!(
+            wrapped
+                .resume_wrap(
+                    &id1,
+                    &mut a.keys,
+                    &ah,
+                    &mut directory,
+                    &mut astore,
+                    [90; 32]
+                )
+                .await
+                .is_err()
+        );
         let wire1b = wire1.bytes().to_vec();
         let at2 = Threads::load(a.binding.clone(), SLOT, &astore).unwrap();
         let prep2 = at2
@@ -434,4 +477,118 @@ fn two_pending_reverse_order_delayed_acks_survive_reopen() {
             2
         );
     });
+}
+
+async fn recovery_refusals(
+    a: &mut Fixture,
+    b: &Fixture,
+    source: &Store<Memory>,
+    id: [u8; 32],
+    epoch: u64,
+    ciphertext: &[u8],
+    devices: &mut Directory,
+) {
+    let handle = a.keys.key(cdlv::purpose()).await.unwrap();
+    let mut empty_outbox = copied_store(a, source).await;
+    let loaded = Delivery::load(a.binding.clone(), &empty_outbox).unwrap();
+    assert_eq!(
+        loaded
+            .resume_wrap(
+                &id,
+                &mut a.keys,
+                &handle,
+                devices,
+                &mut empty_outbox,
+                [170; 32]
+            )
+            .await
+            .err(),
+        Some(cdlv::Error::State)
+    );
+    assert_eq!(
+        loaded
+            .resume_wrap(
+                &[0; 32],
+                &mut a.keys,
+                &handle,
+                devices,
+                &mut empty_outbox,
+                [170; 32]
+            )
+            .await
+            .err(),
+        Some(cdlv::Error::State)
+    );
+    let forged = [
+        b"not an event".to_vec(),
+        serde_json::to_vec(&Event::Joined).unwrap(),
+        serde_json::to_vec(&Event::Ciphertext {
+            id: [99; 32],
+            epoch,
+            bytes: ciphertext.to_vec(),
+        })
+        .unwrap(),
+        serde_json::to_vec(&Event::Ciphertext {
+            id,
+            epoch: epoch + 1,
+            bytes: ciphertext.to_vec(),
+        })
+        .unwrap(),
+        serde_json::to_vec(&Event::Ciphertext {
+            id,
+            epoch,
+            bytes: b"changed".to_vec(),
+        })
+        .unwrap(),
+    ];
+    for bytes in forged {
+        let mut store = copied_store(a, source).await;
+        store
+            .commit(
+                store.version().unwrap(),
+                [171; 32],
+                &[],
+                &[cwst::Output {
+                    id: [172; 32],
+                    bytes,
+                }],
+            )
+            .await
+            .unwrap();
+        let loaded = Delivery::load(a.binding.clone(), &store).unwrap();
+        assert_eq!(
+            loaded
+                .resume_wrap(&id, &mut a.keys, &handle, devices, &mut store, [173; 32])
+                .await
+                .err(),
+            Some(cdlv::Error::State)
+        );
+    }
+    let mut store = copied_store(a, source).await;
+    store
+        .commit(
+            store.version().unwrap(),
+            [174; 32],
+            &[],
+            source.load_pending().unwrap(),
+        )
+        .await
+        .unwrap();
+    let loaded = Delivery::load(a.binding.clone(), &store).unwrap();
+    // A real purpose handle from another member is not publication authority.
+    assert_eq!(
+        loaded
+            .resume_wrap(&id, &mut a.keys, &b.handle, devices, &mut store, [175; 32])
+            .await
+            .err(),
+        Some(cdlv::Error::Scope)
+    );
+    let canceled = loaded.cancel(&id, &mut store, [176; 32]).await.unwrap();
+    assert_eq!(
+        canceled
+            .resume_wrap(&id, &mut a.keys, &handle, devices, &mut store, [177; 32])
+            .await
+            .err(),
+        Some(cdlv::Error::State)
+    );
 }

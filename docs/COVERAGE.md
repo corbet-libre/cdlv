@@ -28,7 +28,7 @@ The remaining two arms contradict the same private-state invariant:
   and requires every Accepted record to contain its exact verified ACK.
 - `outgoing` creates only outbound Pending records. `acknowledged` can only set
   Accepted; `cancel` requires an outbound Pending record before setting
-  CanceledUnconfirmed. `wrap` changes only stored wire bytes. Candidate commit
+  CanceledUnconfirmed. `wrap` and `resume_wrap` share one helper that changes only stored wire bytes. Candidate commit
   reloads through the same validation. No operation can make inbound Pending or
   CanceledUnconfirmed state usable.
 - In `wrap`, the status comparison first rejects everything except Pending.
