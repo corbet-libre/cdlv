@@ -1,4 +1,6 @@
 //! Real OpenMLS and scoped Keys vectors. Test issuers are not production G3/G2.
+#[path = "support/reordering.rs"]
+mod reordering;
 mod support;
 use cdlv::{Authenticated, Delivery, Status};
 use ckmg::{Binding, KeyHandle, Lineage};

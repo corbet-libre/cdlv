@@ -29,7 +29,8 @@ ACK does not Answer, Close or Punish. Only the new signed evidence is rechecked;
 accepted historical records survive credential changes. Enqueue/retry requires
 current established Contacts, the exact shared version, and current MLS recipient
 certificate. First-contact release refuses until Waves supplies real accepted
-reservations and current record evidence; no test-only positive production path.
+reservations; no test-only positive production path. Public record and punishment
+formats remain reserved while those features are disabled in the MVP.
 
 Mesh and Records adapters remain owner integration work. The current Wire is one
 complete application message, not a new frame or transport. Public-room delivery,
@@ -60,3 +61,13 @@ Historical signatures remain verifiable after rotation; live publication and
 retry separately require current device authority. Real encrypted-Store vectors
 alter these fields and receipts, and race a separate Store writer against
 recipient publication. A failed compound write releases neither history nor ACK.
+
+A restart between the compound send checkpoint and envelope signing resumes with
+`Delivery::resume_wrap`. It reads the authenticated Storage outbox, matches the
+original message ID and MLS epoch, and verifies the ciphertext hash against that
+committed journal entry. Missing, malformed, substituted or retired output cannot
+create a send. The shared wrapping path rechecks current Contacts and device
+certificates and checkpoints the signed envelope before returning Wire. Once the
+envelope exists, use ordinary retry; it returns the exact stored envelope.
+This recovery continues one device's durable send and does not copy a live MLS
+ratchet to a different device.
