@@ -25,7 +25,7 @@ mkdir -p .moon/cache
 ln -sfn "$state/moon-cache/hashes" .moon/cache/hashes
 ln -sfn "$state/moon-cache/outputs" .moon/cache/outputs
 tool_source=github:NixOS/nixpkgs/b7c2ada94fe99c15b0dbcf4d11fd7850b957a436
-tool_paths=$(nix build --no-link --print-out-paths "$tool_source#moon" "$tool_source#proto" "$tool_source#python3" "$tool_source#jq" "$tool_source#curl" "$tool_source#chromedriver" "$tool_source#chromium")
+tool_paths=$(nix build --no-link --print-out-paths "$tool_source#moon" "$tool_source#proto" "$tool_source#python3" "$tool_source#jq" "$tool_source#curl" "$tool_source#chromedriver" "$tool_source#chromium" "$tool_source#cargo-llvm-cov" "$tool_source#cargo-deny")
 for path in $tool_paths; do PATH="$path/bin:$PATH"; done
 export PROTO_HOME="$toolchains/proto" RUSTUP_HOME="$toolchains/rustup"
 export CARGO_HOME="$toolchains/cargo" MOON_HOME="$state/moon-home"
@@ -35,15 +35,13 @@ export PATH="$(dirname "$CCID_BIN"):$CARGO_HOME/bin:$PROTO_HOME/shims:$PROTO_HOM
 export CI_JOBS="${CI_JOBS:-2}" CARGO_BUILD_JOBS="${CI_JOBS:-2}"
 export RUST_TEST_THREADS="${CI_TEST_THREADS:-2}"
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
-if [ -n "${GIT_CONFIG_COUNT:-}" ]; then
-  echo 'GIT_CONFIG_COUNT is already set; refusing to overwrite job git config' >&2
-  exit 2
-fi
-export GIT_CONFIG_COUNT=2
-export GIT_CONFIG_KEY_0='url.https://git.corbet.ch/corbet-libs/.insteadOf'
-export GIT_CONFIG_VALUE_0='https://github.com/corbet-libs/'
-export GIT_CONFIG_KEY_1='url.https://git.corbet.ch/corbet-foss/.insteadOf'
-export GIT_CONFIG_VALUE_1='https://github.com/corbet-foss/'
+# Append to any git config the verified runtime already supplies through the environment.
+git_config_base=${GIT_CONFIG_COUNT:-0}
+export GIT_CONFIG_COUNT=$((git_config_base + 2))
+export "GIT_CONFIG_KEY_$((git_config_base + 0))=url.https://git.corbet.ch/corbet-libs/.insteadOf"
+export "GIT_CONFIG_VALUE_$((git_config_base + 0))=https://github.com/corbet-libs/"
+export "GIT_CONFIG_KEY_$((git_config_base + 1))=url.https://git.corbet.ch/corbet-foss/.insteadOf"
+export "GIT_CONFIG_VALUE_$((git_config_base + 1))=https://github.com/corbet-foss/"
 # Shared-first toolchain lock: production base helper verbatim (no MSRV extra;
 # hosted uses stable only; nightly coverage rides the same gate->main flow).
 TOOLCHAIN_LOCK_FILE="$toolchains/install.lock"
@@ -62,6 +60,12 @@ export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
 export ARTIFACT_ROOT="${ARTIFACT_ROOT:-$state/release-artifacts}"
 mkdir -p "$ARTIFACT_ROOT"
 [[ "$ARTIFACT_ROOT" = /* ]] || { echo "ARTIFACT_ROOT must be absolute" >&2; exit 2; }
+# CI resolves google-chrome from PATH; provide the pinned chromium behind that
+# name (fingerprint and browser legs rely on it). Job-state dir, no host change.
+mkdir -p "$state/chrome-shim"
+printf '#!/bin/sh\nexec chromium "$@"\n' > "$state/chrome-shim/google-chrome"
+chmod +x "$state/chrome-shim/google-chrome"
+export PATH="$state/chrome-shim:$PATH"
 export SOURCE_SHA256="$(git archive --format=tar HEAD | sha256sum | cut -d ' ' -f 1)"
 export CCID_SOURCE_REVISION="$CI_COMMIT_SHA"
 "$CCID_BIN" render --repo "$PWD" --check
@@ -72,10 +76,22 @@ cargo --version
 python3 --version
 jq --version
 curl --version
+cargo-deny --version
 chromedriver --version
 google-chrome --version
 rustup run nightly rustc -vV
 rustup run nightly cargo llvm-cov --version
 "$CCID_BIN" cached --repo "$PWD" --check verify
 test -s ".ccid/results/verify.jsonl"
-"$CCID_BIN" check --repo "$PWD" --check advisories
+# Surface the exact `cargo deny` report: run the fresh advisories check with
+# stdout+stderr captured to a job-local file, print it, and preserve the
+# original exit code (gate unchanged, no advisories disabled).
+advisories_log="$(mktemp)"
+if "$CCID_BIN" check --repo "$PWD" --check advisories >"$advisories_log" 2>&1; then
+  advisories_rc=0
+else
+  advisories_rc=$?
+fi
+cat "$advisories_log"
+rm -f "$advisories_log"
+exit "$advisories_rc"
