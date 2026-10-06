@@ -1,0 +1,24 @@
+schema = 1
+project = "cdlv"
+
+# Preserved hosted Linux gates live here; no pre-existing .ci/ccid.toml existed,
+# so every hosted Linux check below is the preserved contract (resolve/cargo-update
+# excluded per prior-cohort rule; registry/live reads stay FRESH outside cache).
+[checks.verify]
+kind = "commands"
+commands = [["bash", ".ci/verify.sh"]]
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["curl", "--version"], ["chromedriver", "--version"], ["google-chrome", "--version"], ["rustup", "run", "nightly", "rustc", "-vV"], ["rustup", "run", "nightly", "cargo", "llvm-cov", "--version"]]
+cache_outputs = ["coverage.json", "coverage.lcov", "coverage.txt"]
+
+[checks.advisories]
+kind = "commands"
+commands = [["cargo", "deny", "--locked", "check", "advisories"]]
+
+[render]
+tool_revision = "81ebac8e86e20bc93b69d5e912bbcb0c0d036d58"
+
+[jobs.verify]
+scheduler = "crow"
+checks = ["verify", "advisories"]
+workflow = "repository-jobs"
+command = ["bash", ".ci/run-cached.sh"]
