@@ -1,5 +1,6 @@
 schema = 1
 project = "cdlv"
+repository = "https://git.corbet.ch/corbet-foss/cdlv.git"
 
 # Preserved hosted Linux gates live here; no pre-existing .ci/ccid.toml existed,
 # so every hosted Linux check below is the preserved contract (resolve/cargo-update
@@ -15,10 +16,17 @@ kind = "commands"
 commands = [["cargo", "deny", "--locked", "check", "advisories"]]
 
 [render]
-tool_revision = "81ebac8e86e20bc93b69d5e912bbcb0c0d036d58"
+tool_revision = "53c129c2efa3b9279d2ecbc237d15acdfb656d8c"
 
 [jobs.verify]
 scheduler = "crow"
 checks = ["verify", "advisories"]
 workflow = "repository-jobs"
 command = ["bash", ".ci/run-cached.sh"]
+
+[push_consumer.cmsg-v01]
+consumer = "https://git.corbet.ch/corbet-libs/cmsg.git"
+branch = "v01"
+consumer_branch = "v01"
+job = "v01-push"
+self_name = "cdlv"
