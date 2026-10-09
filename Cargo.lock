@@ -224,7 +224,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 [[package]]
 name = "cgrp"
 version = "0.1.0"
-source = "git+https://github.com/corbet-foss/cgrp?branch=main#52fcc459cf55ff17d68bfb37c0b2c0f87271e733"
+source = "git+https://github.com/corbet-foss/cgrp?branch=main#86e62fc3e521df63daa1df0478a55404211742a9"
 dependencies = [
  "ckmg",
  "schemars",
@@ -308,7 +308,7 @@ dependencies = [
 [[package]]
 name = "ckmg"
 version = "0.0.0"
-source = "git+https://github.com/corbet-foss/ckmg?branch=main#08c47d7495b67dc28a795075d9d6ebb65667f663"
+source = "git+https://github.com/corbet-foss/ckmg?branch=main#86beae6226af7786b3dba7d2511181a4c0a276ae"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -471,7 +471,7 @@ dependencies = [
 [[package]]
 name = "ctcs"
 version = "0.1.0"
-source = "git+https://github.com/corbet-foss/ctcs?branch=main#5a66c1f9fe6b9e0476c1e82660bd5818f59e5a28"
+source = "git+https://github.com/corbet-foss/ctcs?branch=main#7dc2d3aad47873d485e3bc5e1cf4e5a02ea7dcf3"
 dependencies = [
  "ckmg",
  "cwst",
@@ -483,7 +483,7 @@ dependencies = [
 [[package]]
 name = "cthr"
 version = "0.1.0"
-source = "git+https://github.com/corbet-foss/cthr?branch=main#6dcdc1adbf67c31bab90b80aa0a9bc49b396ad9f"
+source = "git+https://github.com/corbet-foss/cthr?branch=main#eec2d25e7e386a51d3aa4529179bc190995264ed"
 dependencies = [
  "cgrp",
  "ckmg",
@@ -566,7 +566,7 @@ dependencies = [
 [[package]]
 name = "cwst"
 version = "0.0.0"
-source = "git+https://github.com/corbet-foss/cwst?branch=main#f1681ebb167f3d3328f994a6e5d8d5c44f5e68ea"
+source = "git+https://github.com/corbet-foss/cwst?branch=main#d3e16e17907028ac7700b2bc730eac24508a9280"
 dependencies = [
  "atomicwrites",
  "blake3",
