@@ -754,6 +754,33 @@ impl Candidate {
         store: &mut Store<B>,
         operation: [u8; 32],
     ) -> Result<Committed> {
+        let staged = self
+            .stage(keys, authority, devices, store, operation)
+            .await?;
+        let version = store
+            .commit(
+                staged.expected(),
+                operation,
+                &staged.changes(),
+                staged.outputs(),
+            )
+            .await
+            .map_err(storage_error)?;
+        Ok(staged.finish(version))
+    }
+    /// Run every check `commit` runs and serialize this owner's and Threads'
+    /// changes and pending outputs, without writing. The caller commits
+    /// `Staged::changes` and `Staged::outputs` with companion owners in ONE
+    /// Store transaction at `Staged::expected` and the same `operation`, then
+    /// calls `Staged::finish` with the returned version.
+    pub async fn stage<B: Backend>(
+        self,
+        keys: &mut impl cthr::keys::Custody,
+        authority: &mut impl cthr::DirectAuthority,
+        devices: &mut impl DeviceAuthority,
+        store: &Store<B>,
+        operation: [u8; 32],
+    ) -> Result<Staged> {
         let prior = Delivery {
             journal: self.journal,
             expected: self.expected,
@@ -792,21 +819,52 @@ impl Candidate {
         let bytes = encode_journal(&prior.journal)?;
         let threads = self
             .threads
-            .commit(
-                keys,
-                authority,
-                store,
-                operation,
-                &[Change::Put {
-                    owner: OWNER,
-                    key: KEY,
-                    value: &bytes,
-                }],
-            )
+            .stage(keys, authority, store, operation)
             .await
             .map_err(Error::Threads)?;
-        let delivery = Delivery::load(prior.journal.binding, store)?;
-        Ok(Committed { threads, delivery })
+        Ok(Staged {
+            threads,
+            journal: prior.journal,
+            bytes,
+        })
+    }
+}
+/// A fully checked delivery and thread change that has not been written.
+/// Dropping it publishes nothing.
+pub struct Staged {
+    threads: cthr::Staged,
+    journal: Journal,
+    bytes: Vec<u8>,
+}
+impl Staged {
+    /// The Store version the shared transaction must be fenced at.
+    pub fn expected(&self) -> u64 {
+        self.threads.expected()
+    }
+    /// Delivery's and Threads' changes for the shared transaction.
+    pub fn changes(&self) -> Vec<Change<'_>> {
+        let mut changes = self.threads.changes();
+        changes.push(Change::Put {
+            owner: OWNER,
+            key: KEY,
+            value: &self.bytes,
+        });
+        changes
+    }
+    /// The pending outputs the same transaction must carry.
+    pub fn outputs(&self) -> &[cwst::Output] {
+        self.threads.outputs()
+    }
+    /// Adopt the version returned by the shared transaction.
+    pub fn finish(self, version: u64) -> Committed {
+        Committed {
+            threads: self.threads.finish(version),
+            delivery: Delivery {
+                journal: self.journal,
+                expected: version,
+                base: Some(self.bytes),
+            },
+        }
     }
 }
 

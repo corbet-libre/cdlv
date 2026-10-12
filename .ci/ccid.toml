@@ -18,9 +18,20 @@ commands = [["cargo", "deny", "--locked", "check", "advisories"]]
 [render]
 tool_revision = "e38f347d6941aa105ac4b55a0d4b8fec2ef22433"
 
+[checks.resolve-dependencies]
+kind = "commands"
+commands = [["bash", ".ci/resolve-dependencies.sh"]]
+cache_outputs = ["Cargo.lock"]
+
 [jobs.verify]
 scheduler = "crow"
 checks = ["verify", "advisories"]
+workflow = "repository-jobs"
+command = ["bash", ".ci/run-cached.sh"]
+
+[jobs.resolve-dependencies]
+scheduler = "crow"
+checks = ["resolve-dependencies"]
 workflow = "repository-jobs"
 command = ["bash", ".ci/run-cached.sh"]
 
