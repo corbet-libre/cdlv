@@ -765,7 +765,7 @@ impl Candidate {
                 staged.outputs(),
             )
             .await
-            .map_err(storage_error)?;
+            .map_err(|_| Error::Threads(cthr::Error::Storage))?;
         Ok(staged.finish(version))
     }
     /// Run every check `commit` runs and serialize this owner's and Threads'
