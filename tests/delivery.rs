@@ -231,6 +231,47 @@ impl Fixture {
             .await
             .unwrap();
     }
+    /// The settled Answer after `begin`: Pending becomes Established.
+    async fn answered(&mut self, peer: &str, store: &mut Store<Memory>) {
+        let handle = self.keys.key(ctcs::purpose()).await.unwrap();
+        let proof = SigningKey::from_bytes(&[72; 32])
+            .sign(&answer_bytes(&self.binding, peer, &SLOT))
+            .to_bytes()
+            .to_vec();
+        let contacts = ctcs::Contacts::load(self.binding.clone(), store).unwrap();
+        let event = contacts
+            .request(
+                peer,
+                ctcs::Action::Answered {
+                    conversation: SLOT,
+                    evidence: proof,
+                },
+            )
+            .unwrap();
+        let cert = handle.certificate().clone();
+        let signature = self
+            .keys
+            .sign(&handle, &event.signing_bytes(&cert).unwrap())
+            .await
+            .unwrap();
+        contacts
+            .prepare(
+                event.signed(cert, signature),
+                &mut self.directory,
+                &mut Answers,
+            )
+            .await
+            .unwrap()
+            .commit(
+                (&mut self.directory, &mut Answers),
+                store,
+                [98; 32],
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+    }
     async fn establish(&mut self, peer: &str, store: &mut Store<Memory>) {
         let handle = self.keys.key(ctcs::purpose()).await.unwrap();
         let proof = SigningKey::from_bytes(&[72; 32])
@@ -1822,6 +1863,17 @@ fn claim_lets_a_pending_relation_send_but_never_receive() {
                 .is_ok()
         );
         drop(delivery);
+        // The Answer proof verifies: the relation is Established and the very
+        // same durable message is retried without any claim.
+        a.answered("bob", &mut astore).await;
+        let settled = Delivery::load(a.binding.clone(), &astore).unwrap();
+        assert_eq!(settled.status(&id), Some(Status::Pending));
+        assert!(
+            settled
+                .retry(&id, &mut directory, &contacts(&a, &astore))
+                .await
+                .is_ok()
+        );
         assert_eq!(sent.delivery.status(&id), Some(Status::Pending));
     });
 }
