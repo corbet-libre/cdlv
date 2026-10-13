@@ -1,4 +1,6 @@
 //! Real OpenMLS and scoped Keys vectors. Test issuers are not production G3/G2.
+#[path = "support/reordering.rs"]
+mod reordering;
 mod support;
 use cdlv::{Authenticated, Delivery, Status};
 use ckmg::{Binding, KeyHandle, Lineage};
@@ -192,6 +194,78 @@ impl Fixture {
                 (&mut self.directory, &mut Answers),
                 store,
                 [operation; 32],
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+    }
+    /// First contact begun but never answered: the relation stays Pending.
+    async fn begin(&mut self, peer: &str, store: &mut Store<Memory>) {
+        let handle = self.keys.key(ctcs::purpose()).await.unwrap();
+        let contacts = ctcs::Contacts::load(self.binding.clone(), store).unwrap();
+        let event = contacts
+            .request(peer, ctcs::Action::Begin { conversation: SLOT })
+            .unwrap();
+        let cert = handle.certificate().clone();
+        let signature = self
+            .keys
+            .sign(&handle, &event.signing_bytes(&cert).unwrap())
+            .await
+            .unwrap();
+        contacts
+            .prepare(
+                event.signed(cert, signature),
+                &mut self.directory,
+                &mut Answers,
+            )
+            .await
+            .unwrap()
+            .commit(
+                (&mut self.directory, &mut Answers),
+                store,
+                [99; 32],
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+    }
+    /// The settled Answer after `begin`: Pending becomes Established.
+    async fn answered(&mut self, peer: &str, store: &mut Store<Memory>) {
+        let handle = self.keys.key(ctcs::purpose()).await.unwrap();
+        let proof = SigningKey::from_bytes(&[72; 32])
+            .sign(&answer_bytes(&self.binding, peer, &SLOT))
+            .to_bytes()
+            .to_vec();
+        let contacts = ctcs::Contacts::load(self.binding.clone(), store).unwrap();
+        let event = contacts
+            .request(
+                peer,
+                ctcs::Action::Answered {
+                    conversation: SLOT,
+                    evidence: proof,
+                },
+            )
+            .unwrap();
+        let cert = handle.certificate().clone();
+        let signature = self
+            .keys
+            .sign(&handle, &event.signing_bytes(&cert).unwrap())
+            .await
+            .unwrap();
+        contacts
+            .prepare(
+                event.signed(cert, signature),
+                &mut self.directory,
+                &mut Answers,
+            )
+            .await
+            .unwrap()
+            .commit(
+                (&mut self.directory, &mut Answers),
+                store,
+                [98; 32],
                 &[],
                 &[],
             )
@@ -1676,5 +1750,130 @@ fn corrupted_delivery_checkpoint_has_no_usable_status_or_receipt() {
                 .unwrap();
             assert_eq!(Delivery::load(a.binding.clone(), &store).err(), Some(error));
         }
+    });
+}
+
+// A Claimed Answer lets a Pending relation SEND and nothing else: the claim
+// must name exactly this peer and conversation, and receiving still needs
+// Established.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn claim_lets_a_pending_relation_send_but_never_receive() {
+    block_on(async {
+        let mut directory = Directory::default();
+        let mut a = Fixture::new("alice", 1, directory.clone()).await;
+        let mut b = Fixture::new("bob", 2, directory.clone()).await;
+        let (_abackend, mut astore) = a.store().await;
+        let (_bbackend, mut bstore) = b.store().await;
+        a.begin("bob", &mut astore).await;
+        let at = Threads::load(a.binding.clone(), SLOT, &astore).unwrap();
+        let bt = Threads::load(b.binding.clone(), SLOT, &bstore).unwrap();
+        let package = bt
+            .key_package(&mut b.port())
+            .await
+            .unwrap()
+            .commit(&mut b.port(), &mut Grant::new(), &mut bstore, [1; 32], &[])
+            .await
+            .unwrap();
+        let Event::KeyPackage { bytes } = &package.events()[0] else {
+            panic!()
+        };
+        let invitation = at
+            .create_direct(&mut a.port(), &mut Grant::new(), "bob", bytes)
+            .await
+            .unwrap()
+            .commit(&mut a.port(), &mut Grant::new(), &mut astore, [1; 32], &[])
+            .await
+            .unwrap();
+        macro_rules! prepared {
+            () => {
+                invitation
+                    .threads()
+                    .send(&mut a.port(), &mut Grant::new(), b"early hello")
+                    .await
+                    .unwrap()
+            };
+        }
+        let relation = contacts(&a, &astore).relation("bob").unwrap();
+        assert_eq!(relation.state, ctcs::State::Pending);
+        let plain = Delivery::load(a.binding.clone(), &astore).unwrap();
+        assert_eq!(
+            plain.outgoing(prepared!(), &contacts(&a, &astore)).err(),
+            Some(cdlv::Error::Unavailable)
+        );
+        for wrong in [
+            cdlv::Claim::new("carol", &SLOT),
+            cdlv::Claim::new("bob", &[18; 32]),
+        ] {
+            let delivery = Delivery::load(a.binding.clone(), &astore)
+                .unwrap()
+                .with_claim(wrong);
+            assert_eq!(
+                delivery.outgoing(prepared!(), &contacts(&a, &astore)).err(),
+                Some(cdlv::Error::Unavailable)
+            );
+        }
+        let claimed = Delivery::load(a.binding.clone(), &astore)
+            .unwrap()
+            .with_claim(cdlv::Claim::new("bob", &SLOT));
+        let candidate = claimed
+            .outgoing(prepared!(), &contacts(&a, &astore))
+            .unwrap();
+        let sent = candidate
+            .commit(
+                &mut a.port(),
+                &mut Grant::new(),
+                &mut directory,
+                &mut astore,
+                [3; 32],
+            )
+            .await
+            .unwrap();
+        let id = *sent.threads.outgoing()[0].id();
+        assert_eq!(sent.delivery.status(&id), Some(Status::Pending));
+        let handle = a.keys.key(cdlv::purpose()).await.unwrap();
+        let (delivery, wire) = sent
+            .delivery
+            .wrap(
+                &sent.threads.outgoing()[0],
+                &mut a.keys,
+                &handle,
+                &mut directory,
+                &mut astore,
+                [4; 32],
+            )
+            .await
+            .unwrap();
+        assert!(!wire.bytes().is_empty());
+        // A reloaded delivery has no claim: a retry waits for the settled
+        // Answer or a fresh claim, and the durable message stays.
+        let reloaded = Delivery::load(a.binding.clone(), &astore).unwrap();
+        assert_eq!(
+            reloaded
+                .retry(&id, &mut directory, &contacts(&a, &astore))
+                .await
+                .err(),
+            Some(cdlv::Error::Unavailable)
+        );
+        let again = reloaded.with_claim(cdlv::Claim::new("bob", &SLOT));
+        assert!(
+            again
+                .retry(&id, &mut directory, &contacts(&a, &astore))
+                .await
+                .is_ok()
+        );
+        drop(delivery);
+        // The Answer proof verifies: the relation is Established and the very
+        // same durable message is retried without any claim.
+        a.answered("bob", &mut astore).await;
+        let settled = Delivery::load(a.binding.clone(), &astore).unwrap();
+        assert_eq!(settled.status(&id), Some(Status::Pending));
+        assert!(
+            settled
+                .retry(&id, &mut directory, &contacts(&a, &astore))
+                .await
+                .is_ok()
+        );
+        assert_eq!(sent.delivery.status(&id), Some(Status::Pending));
     });
 }

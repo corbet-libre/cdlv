@@ -12,3 +12,5 @@ First-party dependencies follow main with one revision per crate in Cargo.lock.
 
 Stage explicit paths, small plain-English commits, pull --rebase before main
 pushes. Never force push, publish registries, expose secrets or add AI attribution.
+
+Current working rules (2026-10-12): the live line is branch v01 and CI is Crow through `ci-job` (never GitHub Actions); first-party dependencies follow v01. Punishment and the public record belong to the MVP and the alpha (Julian 2026-10-02 and 2026-10-11); they gate release as the Waves proposal defines.

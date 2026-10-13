@@ -1,0 +1,10 @@
+# Reviewed 2026-10-02: informational unmaintained notice only; no vulnerability exception.
+# Tracking: https://github.com/GnomedDev/proc-macro-error-2/issues/17
+# Chain: OpenMLS RustCrypto -> hpke-rs -> libcrux-sha3 -> hax-lib-macros.
+# Dependabot refreshes the graph; cargo-deny must require removal when unused.
+[advisories]
+unmaintained = "all"
+unused-ignored-advisory = "deny"
+ignore = [
+    { id = "RUSTSEC-2026-0173", reason = "Reviewed 2026-10-02: proc-macro-error2 is informationally unmaintained; no compatible upstream replacement. Remove on upstream fix: https://github.com/GnomedDev/proc-macro-error-2/issues/17" },
+]
