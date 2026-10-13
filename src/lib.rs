@@ -200,10 +200,27 @@ struct Journal {
 fn id_key(id: &[u8; 32]) -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+/// Evidence that Waves holds this member's own Claimed Answer for exactly this
+/// peer and conversation (proof still pending). Only the Waves facade issues
+/// one, from the committed Waves journal; with it a Pending relation may send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Claim {
+    peer: String,
+    conversation: [u8; 32],
+}
+impl Claim {
+    pub fn new(peer: &str, conversation: &[u8; 32]) -> Self {
+        Self {
+            peer: peer.to_owned(),
+            conversation: *conversation,
+        }
+    }
+}
 pub struct Delivery {
     journal: Journal,
     expected: u64,
     base: Option<Vec<u8>>,
+    claim: Option<Claim>,
 }
 /// Authentic bytes remain unaccepted until real Threads decryption and the
 /// combined recipient checkpoint have succeeded.
@@ -271,6 +288,7 @@ pub struct Candidate {
     base: Option<Vec<u8>>,
     message: [u8; 32],
     requires_contact: bool,
+    claim: Option<Claim>,
 }
 pub struct Committed {
     pub threads: cthr::Committed,
@@ -348,23 +366,50 @@ impl Delivery {
             journal,
             expected,
             base,
+            claim: None,
         })
+    }
+    /// Let a Pending relation SEND (outgoing, wrap, retry, commit) while the
+    /// given Claim holds. Receiving and acknowledging still need Established.
+    pub fn with_claim(mut self, claim: Claim) -> Self {
+        self.claim = Some(claim);
+        self
     }
     pub fn status(&self, id: &[u8; 32]) -> Option<Status> {
         self.journal.records.get(&id_key(id)).map(|r| r.status)
     }
     fn contacts(&self, contacts: &Contacts, peer: &str, conversation: &[u8; 32]) -> Result<()> {
+        self.contacts_for(contacts, peer, conversation, true)
+    }
+    /// `sending` is the only case a Claim may stand in for Established.
+    fn contacts_for(
+        &self,
+        contacts: &Contacts,
+        peer: &str,
+        conversation: &[u8; 32],
+        sending: bool,
+    ) -> Result<()> {
         if contacts.binding() != &self.journal.binding || contacts.version() != self.expected {
             return Err(Error::Conflict);
         }
         // Waves owns first-contact release; there is no accepting substitute.
         let relation = contacts.relation(peer).map_err(scope_error)?;
-        if relation.state != ctcs::State::Established
-            || relation.conversation.as_ref() != Some(conversation)
-        {
+        if relation.conversation.as_ref() != Some(conversation) {
             return Err(Error::Unavailable);
         }
-        Ok(())
+        match relation.state {
+            ctcs::State::Established => Ok(()),
+            ctcs::State::Pending
+                if sending
+                    && !relation.conflicted
+                    && self.claim.as_ref().is_some_and(|claim| {
+                        claim.peer == peer && claim.conversation == *conversation
+                    }) =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::Unavailable),
+        }
     }
     pub async fn authenticate(
         &self,
@@ -389,7 +434,7 @@ impl Delivery {
                 body: Body::Data { id, epoch, wire },
                 ..
             } => {
-                self.contacts(contacts, certificate.binding.member(), &conversation)?;
+                self.contacts_for(contacts, certificate.binding.member(), &conversation, false)?;
                 if let Some(record) = self.journal.records.get(&id_key(&id)) {
                     if record.outgoing
                         || record.peer != certificate.binding.member()
@@ -453,6 +498,7 @@ impl Delivery {
             return Err(Error::Limit);
         }
         let message = record.id;
+        let record_outgoing = record.outgoing;
         let mut journal = self.journal.clone();
         journal.records.insert(id_key(&message), record);
         Ok(Candidate {
@@ -462,6 +508,11 @@ impl Delivery {
             base: self.base.clone(),
             message,
             requires_contact: true,
+            claim: if record_outgoing {
+                self.claim.clone()
+            } else {
+                None
+            },
         })
     }
     pub fn outgoing(&self, threads: cthr::Candidate, contacts: &Contacts) -> Result<Candidate> {
@@ -535,6 +586,7 @@ impl Delivery {
             base: self.base.clone(),
             message: id,
             requires_contact: false,
+            claim: None,
         })
     }
     pub async fn wrap<S: SecureStore, C: Clock, R: Entropy, A: Authority, B: Backend>(
@@ -733,6 +785,7 @@ impl Delivery {
             journal,
             expected,
             base: Some(bytes),
+            claim: None,
         })
     }
     fn check_base<B: Backend>(&self, store: &Store<B>) -> Result<()> {
@@ -785,6 +838,7 @@ impl Candidate {
             journal: self.journal,
             expected: self.expected,
             base: self.base,
+            claim: self.claim,
         };
         prior.check_base(store)?;
         // Recheck newly accepted signed ACKs before publishing either owner.
@@ -826,6 +880,7 @@ impl Candidate {
             threads,
             journal: prior.journal,
             bytes,
+            claim: prior.claim,
         })
     }
 }
@@ -835,6 +890,7 @@ pub struct Staged {
     threads: cthr::Staged,
     journal: Journal,
     bytes: Vec<u8>,
+    claim: Option<Claim>,
 }
 impl Staged {
     /// The Store version the shared transaction must be fenced at.
@@ -863,6 +919,7 @@ impl Staged {
                 journal: self.journal,
                 expected: version,
                 base: Some(self.bytes),
+                claim: self.claim,
             },
         }
     }
