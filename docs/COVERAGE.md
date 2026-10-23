@@ -14,7 +14,7 @@ excluded from production counts. Cargo.lock is resolved once and reused locked.
 ## Inbound record state invariant
 
 The two exact native branch-arm exceptions in
-`.github/coverage-exclusions.json` are proposals requiring independent Opus
+`.github/coverage-exclusions.json` are proposals requiring independent
 review. They do not omit any line, function, file, live authority check or input
 refusal. Before exceptions, actual native and Chrome/Wasm vectors at
 382e2acc00a1d81f5c3c122ea70b99eb67bcbb59 exercise584/584 emitted source lines and
