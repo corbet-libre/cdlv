@@ -220,7 +220,8 @@ impl Guard {
             | Change::Restored(v)
             | Change::Paired(v)
             | Change::Adopted(v)
-            | Change::Revoked(v) => v,
+            | Change::Revoked(v)
+            | Change::DeviceDelegated(v) => v,
             Change::DeviceAuthorized(v) => &v.lineage,
             Change::Rotated(v) => &v.lineage,
             Change::PairingRequested(_) => return,
