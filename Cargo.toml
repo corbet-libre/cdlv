@@ -4,14 +4,14 @@ version = "0.1.0"
 edition = "2024"
 license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
 description = "Authenticated message delivery and recipient acceptance"
-repository = "https://git.corbet.ch/corbet-foss/cdlv.git"
+repository = "https://git.corbet.ch/corbet-libre/cdlv.git"
 publish = false
 
 [dependencies]
-ckmg = { git = "https://git.corbet.ch/corbet-foss/ckmg.git", branch = "main" }
+ckmg = { git = "https://git.corbet.ch/corbet-libre/ckmg.git", branch = "main" }
 cwst = { git = "https://git.corbet.ch/corbet-foss/cwst.git", branch = "main" }
-ctcs = { git = "https://git.corbet.ch/corbet-foss/ctcs.git", branch = "main" }
-cthr = { git = "https://git.corbet.ch/corbet-foss/cthr.git", branch = "main" }
+ctcs = { git = "https://git.corbet.ch/corbet-libre/ctcs.git", branch = "main" }
+cthr = { git = "https://git.corbet.ch/corbet-libre/cthr.git", branch = "main" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
