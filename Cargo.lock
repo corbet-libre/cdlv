@@ -720,7 +720,7 @@ dependencies = [
 [[package]]
 name = "cchr"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-libre/cchr.git?branch=main#6bcd847c8e6cb493949d543b4b1b0ac17607170e"
+source = "git+https://git.corbet.ch/corbet-libre/cchr.git?branch=main#881fe94d524eedf8995dad398f54967dc4c08884"
 dependencies = [
  "blake3",
  "cbcn",
